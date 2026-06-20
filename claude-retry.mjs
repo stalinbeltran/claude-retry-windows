@@ -73,7 +73,10 @@ function calculateWaitMs(text) {
   return CFG.fallbackHours * 3600e3; // fallback
 }
 
-// --- Lanzar claude capturando salida --------------------------------------
+// --- Lanzar claude con streaming en vivo ----------------------------------
+// La salida se reenvia a la terminal en cuanto llega (para no romper el modo
+// interactivo ni ocultar preguntas de aclaracion), y en paralelo se acumula
+// SOLO para poder detectar el limite de uso una vez que el proceso termina.
 function runClaude(args) {
   return new Promise((resolve) => {
     const child = spawn(CFG.claudeBin, args, {
@@ -82,8 +85,14 @@ function runClaude(args) {
     });
     const out = [];
     const err = [];
-    child.stdout.on('data', (d) => out.push(d));
-    child.stderr.on('data', (d) => err.push(d));
+    child.stdout.on('data', (d) => {
+      process.stdout.write(d); // streaming en vivo
+      out.push(d); // acumula solo para detectar el limite
+    });
+    child.stderr.on('data', (d) => {
+      process.stderr.write(d); // streaming en vivo
+      err.push(d); // acumula solo para detectar el limite
+    });
     child.on('error', (e) => resolve({ code: 1, stdout: '', stderr: String(e.message) }));
     child.on('exit', (code) =>
       resolve({
@@ -111,15 +120,13 @@ async function main() {
     const combined = result.stdout + '\n' + result.stderr;
 
     if (!isRateLimited(combined)) {
-      process.stdout.write(result.stdout);
-      if (result.stderr) process.stderr.write(result.stderr);
+      // La salida ya se imprimio en vivo durante el streaming.
       process.exit(result.code);
     }
 
     attempt++;
     if (attempt > CFG.maxRetries) {
       process.stderr.write(`[claude-retry] Maximo de reintentos (${CFG.maxRetries}) alcanzado.\n`);
-      process.stdout.write(result.stdout);
       process.exit(1);
     }
 
