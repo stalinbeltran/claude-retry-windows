@@ -84,9 +84,29 @@ function calculateWaitMs(text) {
 // se hace sobre una ventana final (cola) del texto combinado.
 const DETECT_WINDOW = 4096; // bytes de cola sobre los que se escanea en vivo
 
-function runClaude(args) {
+// Despachador: elige como lanzar claude segun el modo.
+//   - Modo -p/--print  -> tuberias (capturamos la salida, claude no es TUI).
+//   - Modo interactivo -> pseudo-terminal (node-pty) para darle un TTY real Y a
+//     la vez poder leer la salida y detectar el limite. Si node-pty no esta
+//     instalado, caemos a un passthrough transparente (sin deteccion).
+async function runClaude(args) {
+  const interactive = !(args.includes('-p') || args.includes('--print'));
+  if (!interactive) return runClaudePipe(args);
+
+  const pty = await loadPty();
+  if (pty) return runClaudePty(pty, args);
+
+  process.stderr.write(
+    '[claude-retry] node-pty no esta instalado: el modo interactivo correra SIN\n' +
+      'deteccion de limite ni reintento. Para habilitarlos ejecuta: npm install\n'
+  );
+  return runClaudeInherit(args);
+}
+
+// Implementacion por tuberias (modo no interactivo / -p).
+function runClaudePipe(args) {
   return new Promise((resolve) => {
-    const child = spawnClaude(args);
+    const child = spawnClaude(args, [stdinModeFor(args), 'pipe', 'pipe']);
     const out = [];
     const err = [];
     let combined = ''; // texto acumulado (ambos streams) para deteccion en vivo
@@ -128,15 +148,109 @@ function runClaude(args) {
   });
 }
 
+// Carga node-pty de forma perezosa y tolerante: si no esta instalado, devuelve
+// null en vez de lanzar, para que el wrapper siga funcionando sin el.
+let _ptyModule;
+async function loadPty() {
+  if (_ptyModule !== undefined) return _ptyModule;
+  try {
+    const mod = await import('node-pty');
+    _ptyModule = mod.default ?? mod;
+  } catch {
+    _ptyModule = null;
+  }
+  return _ptyModule;
+}
+
+// Implementacion interactiva con pseudo-terminal (node-pty).
+// claude recibe un TTY real (puede dibujar su interfaz), y nosotros leemos lo que
+// pasa por el PTY para reenviarlo a la pantalla y escanear el limite en vivo. El
+// teclado del usuario se reenvia al PTY en modo raw.
+function runClaudePty(pty, args) {
+  return new Promise((resolve) => {
+    const isWin = process.platform === 'win32';
+    // En Windows claude es un .cmd: hay que invocarlo a traves de cmd.exe.
+    const file = isWin ? process.env.ComSpec || 'cmd.exe' : CFG.claudeBin;
+    const spawnArgs = isWin ? ['/c', CFG.claudeBin, ...args] : args;
+
+    const term = pty.spawn(file, spawnArgs, {
+      name: 'xterm-256color',
+      cols: process.stdout.columns || 80,
+      rows: process.stdout.rows || 30,
+      cwd: process.cwd(),
+      env: process.env,
+      // En Windows usamos el backend winpty en vez de ConPTY: ConPTY lanza un
+      // proceso auxiliar (conpty_console_list_agent) que falla con "AttachConsole"
+      // al matar un proceso que ya termino, ensuciando la salida.
+      useConpty: false,
+    });
+
+    let combined = '';
+    let settled = false;
+
+    const stdin = process.stdin;
+    const wasRaw = Boolean(stdin.isTTY);
+    const onStdin = (d) => term.write(d.toString('utf8'));
+    const onResize = () => term.resize(process.stdout.columns || 80, process.stdout.rows || 30);
+
+    const cleanup = () => {
+      stdin.removeListener('data', onStdin);
+      process.stdout.removeListener('resize', onResize);
+      if (wasRaw) {
+        try {
+          stdin.setRawMode(false);
+        } catch {
+          /* ignorado */
+        }
+      }
+      stdin.pause();
+    };
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    if (wasRaw) stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on('data', onStdin);
+    process.stdout.on('resize', onResize);
+
+    term.onData((d) => {
+      process.stdout.write(d); // streaming en vivo (incluye secuencias de la TUI)
+      combined += d;
+      if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
+      if (isRateLimited(combined)) {
+        try {
+          term.kill();
+        } catch {
+          /* ignorado */
+        }
+        settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
+      }
+    });
+    term.onExit(({ exitCode }) => settle({ code: exitCode ?? 0, stdout: '', stderr: '' }));
+  });
+}
+
+// Fallback sin node-pty: cede el control total de la terminal a claude
+// (stdio heredado). El modo interactivo funciona, pero NO podemos leer la salida,
+// asi que no hay deteccion de limite ni reintento en este camino.
+function runClaudeInherit(args) {
+  return new Promise((resolve) => {
+    const child = spawnClaude(args, 'inherit');
+    child.on('error', (e) => {
+      process.stderr.write(`[claude-retry] Error al lanzar claude: ${e.message}\n`);
+      resolve({ code: 1, stdout: '', stderr: '' });
+    });
+    child.on('exit', (code) => resolve({ code: code ?? 0, stdout: '', stderr: '' }));
+  });
+}
+
 // --- Bucle principal ------------------------------------------------------
 async function main() {
   const args = process.argv.slice(2);
-  if (!args.includes('-p') && !args.includes('--print')) {
-    console.error(
-      '[claude-retry] Aviso: este prototipo (Nivel 1) solo maneja el modo no interactivo.\n' +
-        'Anade -p "tu prompt" para que el reintento automatico funcione.\n'
-    );
-  }
 
   let attempt = 0;
   while (true) {
@@ -208,8 +322,7 @@ function stdinModeFor(args) {
 // (necesario para resolver claude.cmd). Al NO pasar un array de args junto a
 // shell:true evitamos el DeprecationWarning DEP0190. En el resto de plataformas
 // usamos spawn sin shell con el array de args tal cual.
-function spawnClaude(args) {
-  const stdio = [stdinModeFor(args), 'pipe', 'pipe'];
+function spawnClaude(args, stdio) {
   if (process.platform === 'win32') {
     const cmdline = [quoteArg(CFG.claudeBin), ...args.map(quoteArg)].join(' ');
     return spawn(cmdline, { stdio, shell: true });

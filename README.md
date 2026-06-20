@@ -21,6 +21,14 @@ Corre en Node nativo (no necesita `tmux` ni `bash`).
 
 - [Node.js](https://nodejs.org/) (probado con v24).
 - El CLI `claude` instalado y accesible en el `PATH`.
+- (Opcional, para el modo interactivo con reintento) la dependencia `node-pty`:
+
+  ```powershell
+  npm install
+  ```
+
+  Sin `node-pty` el modo interactivo sigue funcionando, pero como passthrough
+  transparente: **sin** detección de límite ni reintento en ese modo.
 
 ## Uso
 
@@ -64,16 +72,22 @@ Get-Content .\app.py -Raw | node claude-retry.mjs -p "Revisa este codigo y dime 
 
 ### Opción 4 — Modo interactivo (conversación)
 
-Lánzalo **sin `-p`**. Verás un aviso de que el prototipo apunta al modo no
-interactivo, pero gracias al streaming la conversación se ve en vivo:
+Lánzalo **sin `-p`**. Si `node-pty` está instalado, claude corre dentro de un
+pseudo-terminal (PTY) real, así que su interfaz interactiva funciona con
+normalidad y a la vez seguimos detectando el límite y reintentando:
 
 ```powershell
 node claude-retry.mjs
 ```
 
-> **Nota:** el reintento automático brilla en modo `-p` (un turno → termina → se
-> evalúa). En interactivo la sesión no termina sola, así que el reintento solo
-> actúa si claude corta la salida con un mensaje de límite.
+> **Cómo funciona:** el modo interactivo de claude es una aplicación de terminal
+> (TUI) que necesita un TTY real para dibujarse. Un simple `pipe` se lo quita; por
+> eso usamos `node-pty`, que le da un TTY y a la vez nos deja leer la salida para
+> detectar el límite.
+>
+> **Nota:** si se alcanza el límite en mitad de una sesión interactiva, el wrapper
+> reinicia claude tras la espera. Como es un proceso nuevo, **se pierde el contexto
+> de la conversación** (puedes retomar con `claude --continue` manualmente).
 
 ## Configuración (variables de entorno)
 
@@ -160,6 +174,7 @@ El wrapper escanea la salida combinada (stdout + stderr) contra patrones como
 | Archivo            | Descripción                                            |
 |--------------------|--------------------------------------------------------|
 | `claude-retry.mjs` | El wrapper.                                             |
+| `package.json`     | Metadatos y dependencia opcional `node-pty`.           |
 | `fake-claude.cmd`  | Lanzador del claude falso para pruebas.                |
 | `fake-claude.mjs`  | Claude falso que simula un rate limit.                 |
 | `app.py`           | Demo: servidor web mínimo con la librería estándar.    |

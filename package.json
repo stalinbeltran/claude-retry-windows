@@ -1,0 +1,15 @@
+{
+  "name": "claude-retry",
+  "version": "1.0.0",
+  "description": "Envoltorio Windows-nativo de claude que reintenta al alcanzar el limite de uso (con streaming y modo interactivo via PTY).",
+  "type": "module",
+  "bin": {
+    "claude-retry": "claude-retry.mjs"
+  },
+  "scripts": {
+    "start": "node claude-retry.mjs"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  }
+}
