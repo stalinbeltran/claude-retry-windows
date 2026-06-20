@@ -13,7 +13,7 @@
 //   CR_MARGIN_SECONDS     (def 30)    segundos extra de margen tras la hora de reinicio
 //   CR_FALLBACK_HOURS     (def 5)     espera si no se logra parsear la hora de reinicio
 //   CR_CLAUDE_BIN         (def auto)  ruta al binario de claude
-//   CR_AUTO_CONFIRM       (def off)   auto-responde prompts de confirmacion (modo interactivo)
+//   CR_AUTO_CONFIRM       (def on)    auto-responde prompts de confirmacion (modo interactivo); CR_AUTO_CONFIRM=0 lo apaga
 //   CR_AUTO_CONFIRM_KEY   (def Enter) tecla a enviar al auto-confirmar ("enter", "1", "y"...)
 //   CR_CONTINUE_ON_RETRY  (def off)   anade --continue al reintentar tras el limite
 
@@ -24,7 +24,7 @@ const CFG = {
   marginSeconds: int(process.env.CR_MARGIN_SECONDS, 30),
   fallbackHours: num(process.env.CR_FALLBACK_HOURS, 5),
   claudeBin: process.env.CR_CLAUDE_BIN || resolveClaudeBin(),
-  autoConfirm: bool(process.env.CR_AUTO_CONFIRM, false),
+  autoConfirm: bool(process.env.CR_AUTO_CONFIRM, true),
   autoConfirmKey: parseKey(process.env.CR_AUTO_CONFIRM_KEY, '\r'),
   continueOnRetry: bool(process.env.CR_CONTINUE_ON_RETRY, false),
 };
@@ -55,12 +55,22 @@ function isRateLimited(text) {
 // resaltada con "❯". En modo -p/--print no hay estos prompts; alli usa los flags
 // nativos --permission-mode acceptEdits o --dangerously-skip-permissions.
 const CONFIRM_PATTERNS = [
-  /Do you want to (proceed|make this edit|create|run|allow|continue)\b/i,
-  /❯\s*1\.\s*Yes\b/, // selector con la opcion por defecto ("Yes") resaltada
+  /Do you want to\b/i, // "Do you want to create/proceed/run/make this edit ...?"
+  /❯\s*1\.\s*Yes\b/i, // selector con la opcion por defecto ("Yes") resaltada
 ];
 
+// Elimina secuencias de escape ANSI (colores y movimiento de cursor). La TUI de
+// claude intercala estos codigos dentro del texto del prompt; si no los quitamos,
+// patrones como /Do you want to/ pueden no casar.
+const ANSI_RE =
+  /[][[\]()#;?]*(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]|[A-Za-z])/g;
+function stripAnsi(s) {
+  return s.replace(ANSI_RE, '');
+}
+
 function isConfirmPrompt(text) {
-  return CONFIRM_PATTERNS.some((re) => re.test(text));
+  const clean = stripAnsi(text);
+  return CONFIRM_PATTERNS.some((re) => re.test(clean));
 }
 
 // --- Parseo de la hora de reinicio ----------------------------------------
@@ -214,6 +224,7 @@ function runClaudePty(pty, args) {
     let combined = '';
     let settled = false;
     let lastConfirmAt = 0; // marca temporal del ultimo auto-confirm (cooldown)
+    let confirmTimer = null; // re-chequeo programado mientras dura el cooldown
 
     const stdin = process.stdin;
     const wasRaw = Boolean(stdin.isTTY);
@@ -221,6 +232,7 @@ function runClaudePty(pty, args) {
     const onResize = () => term.resize(process.stdout.columns || 80, process.stdout.rows || 30);
 
     const cleanup = () => {
+      if (confirmTimer) clearTimeout(confirmTimer);
       stdin.removeListener('data', onStdin);
       process.stdout.removeListener('resize', onResize);
       if (wasRaw) {
@@ -237,6 +249,33 @@ function runClaudePty(pty, args) {
       settled = true;
       cleanup();
       resolve(result);
+    };
+
+    // Auto-confirmacion de prompts de permiso (opt-in, ON por defecto).
+    // Se llama en cada chunk del PTY. Como la deteccion es por eventos, un prompt
+    // que aparece DURANTE el cooldown se quedaria sin responder (claude se queda
+    // quieto, no llega mas texto, y nunca se vuelve a evaluar). Para evitarlo, si
+    // hay un prompt pero seguimos en cooldown, programamos un re-chequeo para
+    // cuando el cooldown termine. Tras responder limpiamos el buffer para no
+    // re-disparar sobre los redibujados del mismo prompt.
+    const maybeAutoConfirm = () => {
+      if (settled || !CFG.autoConfirm || !isConfirmPrompt(combined)) return;
+      const since = Date.now() - lastConfirmAt;
+      if (since < CONFIRM_COOLDOWN_MS) {
+        if (!confirmTimer) {
+          confirmTimer = setTimeout(() => {
+            confirmTimer = null;
+            maybeAutoConfirm();
+          }, CONFIRM_COOLDOWN_MS - since + 50);
+        }
+        return;
+      }
+      term.write(CFG.autoConfirmKey);
+      process.stderr.write(
+        '[claude-retry] prompt de confirmacion detectado: respondido automaticamente.\n'
+      );
+      lastConfirmAt = Date.now();
+      combined = '';
     };
 
     if (wasRaw) stdin.setRawMode(true);
@@ -257,20 +296,7 @@ function runClaudePty(pty, args) {
         settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
         return;
       }
-      // Auto-confirmacion de prompts de permiso/confirmacion (opt-in).
-      // El cooldown evita re-disparar mientras el texto del prompt sigue en el buffer.
-      if (
-        CFG.autoConfirm &&
-        Date.now() - lastConfirmAt > CONFIRM_COOLDOWN_MS &&
-        isConfirmPrompt(combined)
-      ) {
-        term.write(CFG.autoConfirmKey);
-        process.stderr.write(
-          '[claude-retry] prompt de confirmacion detectado: respondido automaticamente.\n'
-        );
-        lastConfirmAt = Date.now();
-        combined = ''; // limpia el buffer para no re-disparar sobre el mismo prompt
-      }
+      maybeAutoConfirm();
     });
     term.onExit(({ exitCode }) => settle({ code: exitCode ?? 0, stdout: '', stderr: '' }));
   });
