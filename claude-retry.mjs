@@ -86,10 +86,7 @@ const DETECT_WINDOW = 4096; // bytes de cola sobre los que se escanea en vivo
 
 function runClaude(args) {
   return new Promise((resolve) => {
-    const child = spawn(CFG.claudeBin, quoteArgsForShell(args), {
-      stdio: ['inherit', 'pipe', 'pipe'],
-      shell: process.platform === 'win32', // permite resolver claude.cmd en Windows
-    });
+    const child = spawnClaude(args);
     const out = [];
     const err = [];
     let combined = ''; // texto acumulado (ambos streams) para deteccion en vivo
@@ -184,19 +181,40 @@ function resolveClaudeBin() {
   // En Windows el binario suele ser claude.cmd; spawn con shell:true lo resuelve por PATH.
   return 'claude';
 }
-// Con shell:true en Windows, Node concatena los argumentos SIN entrecomillarlos,
-// asi que un valor con espacios (p. ej. -p "varias palabras") se parte en tokens
-// y claude solo recibe la primera palabra. Aqui entrecomillamos cada argumento
-// que lo necesite para preservar el prompt completo.
-function quoteArgsForShell(args) {
-  if (process.platform !== 'win32') return args;
-  return args.map((a) => {
-    if (a === '') return '""';
-    if (/[\s"&|<>^()%!]/.test(a)) {
-      return '"' + a.replace(/"/g, '\\"') + '"';
-    }
-    return a;
-  });
+// Entrecomilla un argumento para la linea de comando del shell de Windows.
+// Sin esto, los valores con espacios (p. ej. -p "varias palabras") se parten en
+// tokens y claude solo recibe la primera palabra.
+function quoteArg(a) {
+  if (a === '') return '""';
+  if (/[\s"&|<>^()%!]/.test(a)) {
+    return '"' + a.replace(/"/g, '\\"') + '"';
+  }
+  return a;
+}
+
+// Decide que hacer con el stdin del proceso hijo.
+// En modo -p/--print claude no necesita entrada interactiva; si ademas stdin es
+// una TTY (no hay datos canalizados), lo ignoramos para que claude no espere ~3s
+// por entrada. Si stdin es un pipe (no TTY) lo dejamos pasar por si se estan
+// canalizando datos, p. ej. `type archivo | claude-retry -p "..."`.
+function stdinModeFor(args) {
+  const printMode = args.includes('-p') || args.includes('--print');
+  if (printMode && process.stdin.isTTY) return 'ignore';
+  return 'inherit';
+}
+
+// Lanza el proceso claude de forma portable.
+// En Windows pasamos UNA sola linea de comando ya entrecomillada con shell:true
+// (necesario para resolver claude.cmd). Al NO pasar un array de args junto a
+// shell:true evitamos el DeprecationWarning DEP0190. En el resto de plataformas
+// usamos spawn sin shell con el array de args tal cual.
+function spawnClaude(args) {
+  const stdio = [stdinModeFor(args), 'pipe', 'pipe'];
+  if (process.platform === 'win32') {
+    const cmdline = [quoteArg(CFG.claudeBin), ...args.map(quoteArg)].join(' ');
+    return spawn(cmdline, { stdio, shell: true });
+  }
+  return spawn(CFG.claudeBin, args, { stdio, shell: false });
 }
 // Mata el proceso hijo Y todos sus descendientes.
 // En Windows, con shell:true, child.kill() solo mata el cmd que lo lanzo y deja
