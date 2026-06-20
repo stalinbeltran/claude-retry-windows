@@ -180,10 +180,12 @@ cambia el comando global hasta que lo promuevas.
 - Edita libremente `claude-retry.mjs` en el repo. Aunque lo dejes a medias o roto,
   el comando global sigue intacto.
 
-### 3. Validar el cambio sin gastar cuota
+### 3. Probar la versión en edición del repo
 
-Antes de promover, prueba la versión del repo con el claude falso (ver más abajo),
-ejecutándola con `node` directamente (no con el comando global):
+Siempre ejecutándola con `node claude-retry.mjs` (la del repo), **no** con el
+comando global. Tienes dos formas:
+
+**a) Sin gastar cuota — con el claude falso** (para validar la lógica de reintento):
 
 ```powershell
 Remove-Item .\.rl-counter -ErrorAction SilentlyContinue
@@ -193,23 +195,41 @@ node claude-retry.mjs -p "prueba"          # ejecuta la versión EN EDICIÓN del
 Remove-Item Env:CR_CLAUDE_BIN, Env:CR_FALLBACK_HOURS
 ```
 
-### 4. Promover la versión validada al comando global
+**b) Con el claude real** (cuando una prueba lo requiera). Basta con NO fijar
+`CR_CLAUDE_BIN`; la versión en edición usará el `claude` real:
 
-Cuando el cambio esté verificado:
+```powershell
+node claude-retry.mjs -p "responde solo: OK"
+```
+
+> Mientras desarrollas, el comando global `claude-retry` sigue siendo tu motor
+> estable, y `node claude-retry.mjs` es la versión en pruebas. Son independientes.
+
+### 4. Promover la versión validada al comando global (manual)
+
+Esto **lo decides tú**; no es automático. Cuando el cambio esté verificado y
+quieras que el comando global lo incluya:
 
 ```powershell
 npm run promote        # alias de: npm install -g .
 ```
 
-A partir de ahí, el comando global `claude-retry` ya incluye tus cambios.
+Para **confirmar** que el global se actualizó, vuelve a probarlo:
+
+```powershell
+claude-retry -p "responde solo: OK"
+```
+
+Para **revertir** si algo sale mal:
+
+- El archivo del repo: `git checkout claude-retry.mjs` (vuelve al último commit).
+- El comando global: corrige el repo y vuelve a ejecutar `npm run promote`.
 
 > **Instrucción lista para darle a claude:**
-> *"Edita `claude-retry.mjs`, verifícalo con `node claude-retry.mjs` usando el
-> claude falso (`CR_CLAUDE_BIN`), y cuando pase ejecuta `npm run promote` para
-> actualizar el comando global. No promuevas si la verificación falla."*
-
-Si algo sale mal, el comando global no se ve afectado, y `git checkout
-claude-retry.mjs` restaura el archivo del repo a la última versión commiteada.
+> *"Edita `claude-retry.mjs` y verifícalo con `node claude-retry.mjs` (con el claude
+> falso vía `CR_CLAUDE_BIN`, o con el claude real cuando la prueba lo requiera). NO
+> ejecutes `npm run promote` por tu cuenta: la promoción al comando global la haré
+> yo manualmente solo cuando lo ordene."*
 
 ## Cómo detecta el límite
 
