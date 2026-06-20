@@ -1,7 +1,7 @@
 {
   "name": "claude-retry",
   "version": "1.0.0",
-  "description": "Envoltorio Windows-nativo de claude que reintenta al alcanzar el limite de uso (con streaming y modo interactivo via PTY).",
+  "description": "Envoltorio Windows-nativo de claude (modo no interactivo / -p) que reintenta al alcanzar el limite de uso, con streaming en vivo y deteccion en dos capas.",
   "type": "module",
   "bin": {
     "claude-retry": "claude-retry.mjs"
@@ -9,13 +9,8 @@
   "scripts": {
     "start": "node claude-retry.mjs",
     "promote": "npm install -g .",
-    "test": "node tests/test-detection.mjs && node tests/test-verify.mjs && node tests/test-clean-log.mjs",
+    "test": "node tests/test-detection.mjs && node tests/test-retry.mjs",
     "test:detection": "node tests/test-detection.mjs",
-    "test:verify": "node tests/test-verify.mjs",
-    "test:clean-log": "node tests/test-clean-log.mjs"
-  },
-  "dependencies": {
-    "@xterm/headless": "^6.0.0",
-    "node-pty": "^1.0.0"
+    "test:retry": "node tests/test-retry.mjs"
   }
 }

@@ -1,25 +1,32 @@
 #!/usr/bin/env node
-// claude-retry — equivalente Windows-nativo de claude-auto-retry (Nivel 1: modo no interactivo)
+// claude-retry — envoltorio Windows-nativo de claude (modo NO interactivo / -p).
 //
 // Reintenta automaticamente `claude -p ...` cuando se alcanza el limite de uso.
-// No necesita tmux ni bash: corre en Node nativo en Windows.
+// No necesita tmux, bash ni node-pty: corre en Node nativo en Windows, lanzando
+// claude por tuberias (stdin/stdout/stderr) y escaneando la salida en vivo.
 //
 // Uso:
 //   node claude-retry.mjs -p "tu prompt aqui"
-//   node claude-retry.mjs -p "..."  --append-system-prompt "..."   (cualquier flag de claude)
+//   node claude-retry.mjs -p "..."  --permission-mode acceptEdits   (cualquier flag de claude)
+//   type archivo.txt | node claude-retry.mjs -p "revisa esto"       (datos por stdin)
+//
+// IMPORTANTE: esta version es solo para el modo NO interactivo de claude (-p/--print).
+// No lanza la TUI interactiva. Para automatizar permisos usa los flags nativos de
+// claude (p. ej. --permission-mode acceptEdits) o la variable CR_PERMISSION_MODE.
 //
 // Config por variables de entorno (todas opcionales):
 //   CR_MAX_RETRIES        (def 5)     intentos maximos tras detectar limite
 //   CR_MARGIN_SECONDS     (def 30)    segundos extra de margen tras la hora de reinicio
 //   CR_FALLBACK_HOURS     (def 5)     espera si no se logra parsear la hora de reinicio
 //   CR_CLAUDE_BIN         (def auto)  ruta al binario de claude
-//   CR_AUTO_CONFIRM       (def on)    auto-responde prompts de confirmacion (modo interactivo); CR_AUTO_CONFIRM=0 lo apaga
-//   CR_AUTO_CONFIRM_KEY   (def Enter) tecla a enviar al auto-confirmar ("enter", "1", "y"...)
+//   CR_PERMISSION_MODE    (def off)   respuesta automatica a permisos: si tiene valor
+//                                     (p. ej. acceptEdits, plan, bypassPermissions) se
+//                                     reenvia como --permission-mode <valor> cuando el
+//                                     comando no trae ya uno. Asi claude no se detiene a
+//                                     pedir permiso para editar/ejecutar en modo -p.
 //   CR_CONTINUE_ON_RETRY  (def off)   anade --continue al reintentar tras el limite
 //   CR_TRANSCRIPT         (def off)   ruta de archivo donde volcar TODA la salida
-//                                     (util para revisar la sesion completa cuando el
-//                                     scrollback del terminal no conserva el texto que
-//                                     se desborda; p. ej. con winpty en VSCode)
+//                                     (stdout+stderr en bruto, incluidos los reintentos)
 //   CR_DETECTION_PRECISION (def 70)   precision requerida (0-100, o 0-1) para la
 //                                     deteccion ESTADISTICA de limites no catalogados.
 //                                     Es el umbral de confianza minimo para disparar el
@@ -28,16 +35,6 @@
 //                                     variantes debiles); mas bajo = mas sensible.
 //   CR_DETECT_DEBUG       (def off)   imprime en stderr la puntuacion y las senales que
 //                                     casaron en cada deteccion (para ajustar la precision)
-//   CR_VERIFY             (def on)    [solo modo interactivo] al ver un patron de limite NO
-//                                     mata la sesion de inmediato: espera a que la salida se
-//                                     calme y envia una sonda ("continue") para comprobar si
-//                                     el limite es real. Asi evita falsos positivos cuando
-//                                     claude solo MENCIONA el limite (p. ej. revisando codigo
-//                                     sobre cuotas). CR_VERIFY=0 restaura el corte inmediato.
-//   CR_VERIFY_IDLE_MS     (def 1500)  ms que la salida debe estar quieta TRAS el patron antes
-//                                     de enviar la sonda (no interrumpe una respuesta en curso)
-//   CR_VERIFY_WINDOW_MS   (def 8000)  ms de espera a la respuesta de la sonda. Si reaparece el
-//                                     banner -> limite real; si responde normal -> falso positivo
 
 import { spawn, execFile } from 'node:child_process';
 import { createWriteStream, readFileSync } from 'node:fs';
@@ -76,30 +73,17 @@ const CFG = {
   marginSeconds: int(process.env.CR_MARGIN_SECONDS, 30),
   fallbackHours: num(process.env.CR_FALLBACK_HOURS, 5),
   claudeBin: process.env.CR_CLAUDE_BIN || resolveClaudeBin(),
-  autoConfirm: bool(process.env.CR_AUTO_CONFIRM, true),
-  autoConfirmKey: parseKey(process.env.CR_AUTO_CONFIRM_KEY, '\r'),
+  permissionMode: (process.env.CR_PERMISSION_MODE || '').trim(),
   continueOnRetry: bool(process.env.CR_CONTINUE_ON_RETRY, false),
   transcript: process.env.CR_TRANSCRIPT || '',
   detectionPrecision: parsePrecision(process.env.CR_DETECTION_PRECISION, 0.7),
   detectDebug: bool(process.env.CR_DETECT_DEBUG, false),
-  verify: bool(process.env.CR_VERIFY, true),
-  verifyIdleMs: int(process.env.CR_VERIFY_IDLE_MS, 1500),
-  verifyWindowMs: int(process.env.CR_VERIFY_WINDOW_MS, 8000),
 };
-
-// Texto de la sonda de verificacion (modo interactivo). Se escribe en el PTY como
-// un turno real del usuario para forzar a claude a INTENTAR responder: si la cuota
-// esta agotada re-muestra el banner (limite real); si no, responde con normalidad
-// (falso positivo). El '\r' final envia el mensaje.
-const VERIFY_PROBE = 'continue';
 
 // --- Transcripcion a archivo (opcional) -----------------------------------
 // Cuando CR_TRANSCRIPT apunta a un archivo, recogemos TODO lo que claude envia a
-// la pantalla (en modo -p y en modo interactivo, incluyendo los reintentos tras
-// el limite) y lo escribimos en bruto. Esto permite revisar la sesion completa
-// aunque la TUI redibuje en vivo y el scrollback del terminal pierda el texto que
-// se desborda (caso tipico de winpty en el terminal de VSCode). El stream se abre
-// una sola vez por invocacion (trunca al inicio y va acumulando los reintentos).
+// stdout/stderr (incluidos los reintentos tras el limite) y lo escribimos en bruto.
+// El stream se abre una sola vez por invocacion (trunca al inicio y va acumulando).
 let _transcript;
 function writeTranscript(data) {
   if (!CFG.transcript) return;
@@ -209,30 +193,6 @@ function isRateLimited(text) {
     );
   }
   return hit;
-}
-
-// --- Deteccion de prompts de permiso/confirmacion -------------------------
-// Solo aplica al modo interactivo (PTY): claude dibuja un prompt con una pregunta
-// "Do you want to ...?" y una lista de opciones donde la 1a ("Yes") aparece
-// resaltada con "❯". En modo -p/--print no hay estos prompts; alli usa los flags
-// nativos --permission-mode acceptEdits o --dangerously-skip-permissions.
-const CONFIRM_PATTERNS = [
-  /Do you want to\b/i, // "Do you want to create/proceed/run/make this edit ...?"
-  /❯\s*1\.\s*Yes\b/i, // selector con la opcion por defecto ("Yes") resaltada
-];
-
-// Elimina secuencias de escape ANSI (colores y movimiento de cursor). La TUI de
-// claude intercala estos codigos dentro del texto del prompt; si no los quitamos,
-// patrones como /Do you want to/ pueden no casar.
-const ANSI_RE =
-  /[][[\]()#;?]*(?:(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]|[A-Za-z])/g;
-function stripAnsi(s) {
-  return s.replace(ANSI_RE, '');
-}
-
-function isConfirmPrompt(text) {
-  const clean = stripAnsi(text);
-  return CONFIRM_PATTERNS.some((re) => re.test(clean));
 }
 
 // --- Parseo de la hora de reinicio ----------------------------------------
@@ -351,38 +311,18 @@ function calculateWaitMs(text) {
 }
 
 // --- Lanzar claude con streaming en vivo ----------------------------------
-// La salida se reenvia a la terminal en cuanto llega (para no romper el modo
-// interactivo ni ocultar preguntas de aclaracion), y en paralelo se escanea el
-// texto acumulado EN VIVO: en cuanto aparece el patron de limite de uso se mata
-// el proceso y se resuelve, sin esperar al exit. Asi el reintento se dispara
-// aunque la sesion no termine por si sola.
+// La salida se reenvia a la terminal en cuanto llega (para no ocultar las preguntas
+// de aclaracion del modo -p), y en paralelo se escanea el texto acumulado EN VIVO:
+// en cuanto aparece el patron de limite de uso se mata el proceso y se resuelve, sin
+// esperar al exit. Asi el reintento se dispara aunque la salida no termine por si sola.
 //
-// Para evitar reaccionar ante un patron partido entre dos chunks, la deteccion
-// se hace sobre una ventana final (cola) del texto combinado.
+// Para evitar reaccionar ante un patron partido entre dos chunks, la deteccion se
+// hace sobre una ventana final (cola) del texto combinado.
 const DETECT_WINDOW = 4096; // bytes de cola sobre los que se escanea en vivo
-const CONFIRM_COOLDOWN_MS = 1500; // evita re-disparar el auto-confirm sobre el mismo prompt
 
-// Despachador: elige como lanzar claude segun el modo.
-//   - Modo -p/--print  -> tuberias (capturamos la salida, claude no es TUI).
-//   - Modo interactivo -> pseudo-terminal (node-pty) para darle un TTY real Y a
-//     la vez poder leer la salida y detectar el limite. Si node-pty no esta
-//     instalado, caemos a un passthrough transparente (sin deteccion).
-async function runClaude(args) {
-  const interactive = !(args.includes('-p') || args.includes('--print'));
-  if (!interactive) return runClaudePipe(args);
-
-  const pty = await loadPty();
-  if (pty) return runClaudePty(pty, args);
-
-  process.stderr.write(
-    '[claude-retry] node-pty no esta instalado: el modo interactivo correra SIN\n' +
-      'deteccion de limite ni reintento. Para habilitarlos ejecuta: npm install\n'
-  );
-  return runClaudeInherit(args);
-}
-
-// Implementacion por tuberias (modo no interactivo / -p).
-function runClaudePipe(args) {
+// Lanza claude por tuberias (modo no interactivo / -p), captura su salida, la reenvia
+// en vivo y dispara el reintento si detecta el patron de limite.
+function runClaude(args) {
   return new Promise((resolve) => {
     const child = spawnClaude(args, [stdinModeFor(args), 'pipe', 'pipe']);
     const out = [];
@@ -427,231 +367,9 @@ function runClaudePipe(args) {
   });
 }
 
-// Carga node-pty de forma perezosa y tolerante: si no esta instalado, devuelve
-// null en vez de lanzar, para que el wrapper siga funcionando sin el.
-let _ptyModule;
-async function loadPty() {
-  if (_ptyModule !== undefined) return _ptyModule;
-  try {
-    const mod = await import('node-pty');
-    _ptyModule = mod.default ?? mod;
-  } catch {
-    _ptyModule = null;
-  }
-  return _ptyModule;
-}
-
-// Implementacion interactiva con pseudo-terminal (node-pty).
-// claude recibe un TTY real (puede dibujar su interfaz), y nosotros leemos lo que
-// pasa por el PTY para reenviarlo a la pantalla y escanear el limite en vivo. El
-// teclado del usuario se reenvia al PTY en modo raw.
-function runClaudePty(pty, args) {
-  return new Promise((resolve) => {
-    const isWin = process.platform === 'win32';
-    // En Windows claude es un .cmd: hay que invocarlo a traves de cmd.exe.
-    const file = isWin ? process.env.ComSpec || 'cmd.exe' : CFG.claudeBin;
-    const spawnArgs = isWin ? ['/c', CFG.claudeBin, ...args] : args;
-
-    const term = pty.spawn(file, spawnArgs, {
-      name: 'xterm-256color',
-      cols: process.stdout.columns || 80,
-      rows: process.stdout.rows || 30,
-      cwd: process.cwd(),
-      env: process.env,
-      // En Windows usamos el backend winpty en vez de ConPTY: ConPTY lanza un
-      // proceso auxiliar (conpty_console_list_agent) que falla con "AttachConsole"
-      // al matar un proceso que ya termino, ensuciando la salida.
-      useConpty: false,
-    });
-
-    let combined = '';
-    let settled = false;
-    let lastConfirmAt = 0; // marca temporal del ultimo auto-confirm (cooldown)
-    let confirmTimer = null; // re-chequeo programado mientras dura el cooldown
-    // Verificacion de limite (anti falso positivo). Fases:
-    //   'normal'    -> deteccion normal
-    //   'armed'     -> se vio el patron; esperando a que la salida se calme (idle)
-    //   'verifying' -> sonda enviada; esperando veredicto (banner real vs respuesta)
-    let verifyPhase = 'normal';
-    let idleTimer = null; // dispara la sonda cuando la salida lleva CFG.verifyIdleMs quieta
-    let verifyTimer = null; // cierra la ventana de verificacion
-    let sawDataInVerify = false; // hubo salida tras la sonda
-
-    const stdin = process.stdin;
-    const wasRaw = Boolean(stdin.isTTY);
-    const onStdin = (d) => term.write(d.toString('utf8'));
-    const onResize = () => term.resize(process.stdout.columns || 80, process.stdout.rows || 30);
-
-    const cleanup = () => {
-      if (confirmTimer) clearTimeout(confirmTimer);
-      if (idleTimer) clearTimeout(idleTimer);
-      if (verifyTimer) clearTimeout(verifyTimer);
-      stdin.removeListener('data', onStdin);
-      process.stdout.removeListener('resize', onResize);
-      if (wasRaw) {
-        try {
-          stdin.setRawMode(false);
-        } catch {
-          /* ignorado */
-        }
-      }
-      stdin.pause();
-    };
-    const settle = (result) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(result);
-    };
-
-    // Auto-confirmacion de prompts de permiso (opt-in, ON por defecto).
-    // Se llama en cada chunk del PTY. Como la deteccion es por eventos, un prompt
-    // que aparece DURANTE el cooldown se quedaria sin responder (claude se queda
-    // quieto, no llega mas texto, y nunca se vuelve a evaluar). Para evitarlo, si
-    // hay un prompt pero seguimos en cooldown, programamos un re-chequeo para
-    // cuando el cooldown termine. Tras responder limpiamos el buffer para no
-    // re-disparar sobre los redibujados del mismo prompt.
-    const maybeAutoConfirm = () => {
-      if (settled || !CFG.autoConfirm || !isConfirmPrompt(combined)) return;
-      const since = Date.now() - lastConfirmAt;
-      if (since < CONFIRM_COOLDOWN_MS) {
-        if (!confirmTimer) {
-          confirmTimer = setTimeout(() => {
-            confirmTimer = null;
-            maybeAutoConfirm();
-          }, CONFIRM_COOLDOWN_MS - since + 50);
-        }
-        return;
-      }
-      term.write(CFG.autoConfirmKey);
-      process.stderr.write(
-        '[claude-retry] prompt de confirmacion detectado: respondido automaticamente.\n'
-      );
-      lastConfirmAt = Date.now();
-      combined = '';
-    };
-
-    if (wasRaw) stdin.setRawMode(true);
-    stdin.resume();
-    stdin.on('data', onStdin);
-    process.stdout.on('resize', onResize);
-
-    // Confirma el limite como REAL: corta la sesion para que el bucle reintente.
-    const confirmLimit = () => {
-      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-      if (verifyTimer) { clearTimeout(verifyTimer); verifyTimer = null; }
-      try {
-        term.kill();
-      } catch {
-        /* ignorado */
-      }
-      settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
-    };
-
-    // Falso positivo: claude solo mencionaba el limite (o respondio normal a la
-    // sonda). Volvemos a modo normal sin matar la sesion.
-    const dismissAsFalsePositive = (reason) => {
-      verifyPhase = 'normal';
-      combined = '';
-      if (CFG.detectDebug) {
-        process.stderr.write(`[claude-retry][verify] falso positivo (${reason}): se continua la sesion.\n`);
-      }
-    };
-
-    // Fin de la inactividad tras ver el patron: la salida se calmo, asi que enviamos
-    // la sonda y abrimos la ventana de verificacion. Si la verificacion esta
-    // desactivada (CR_VERIFY=0) este camino no se usa: se corta de inmediato.
-    const onIdleAfterPattern = () => {
-      idleTimer = null;
-      if (settled) return;
-      verifyPhase = 'verifying';
-      sawDataInVerify = false;
-      combined = ''; // descarta el texto que disparo la sospecha; solo miramos lo nuevo
-      process.stderr.write(
-        '[claude-retry] posible limite detectado: verificando con una sonda ("continue")...\n'
-      );
-      try { term.write(VERIFY_PROBE); } catch { /* ignorado */ }
-      // Pequena pausa antes del Enter por si la TUI hace autocompletado/bracketed paste.
-      setTimeout(() => {
-        if (settled) return;
-        try { term.write('\r'); } catch { /* ignorado */ }
-      }, 60);
-      verifyTimer = setTimeout(() => {
-        verifyTimer = null;
-        if (verifyPhase !== 'verifying') return;
-        // La ventana se cerro sin que reapareciera el banner.
-        if (!sawDataInVerify) {
-          // Silencio total: una sesion sana responde a "continue"; si no llega nada
-          // asumimos limite real (conservador).
-          process.stderr.write('[claude-retry] sin respuesta a la sonda: se asume limite real.\n');
-          confirmLimit();
-        } else {
-          process.stderr.write('[claude-retry] la sesion respondio sin banner: falso positivo, se continua.\n');
-          dismissAsFalsePositive('respuesta-normal');
-        }
-      }, CFG.verifyWindowMs);
-    };
-
-    term.onData((d) => {
-      process.stdout.write(d); // streaming en vivo (incluye secuencias de la TUI)
-      writeTranscript(d); // copia a archivo si CR_TRANSCRIPT esta activo
-      combined += d;
-      if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
-
-      // Ventana de verificacion abierta: solo nos interesa si REAPARECE el banner.
-      if (verifyPhase === 'verifying') {
-        sawDataInVerify = true;
-        if (isRateLimited(combined)) {
-          process.stderr.write('[claude-retry] el banner de limite reaparecio tras la sonda: limite real.\n');
-          confirmLimit();
-        }
-        return;
-      }
-
-      // Patron ya visto: esperamos a que la salida se calme. Cada chunk nuevo
-      // reinicia el contador de inactividad (no interrumpimos una respuesta en curso).
-      if (verifyPhase === 'armed') {
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = setTimeout(onIdleAfterPattern, CFG.verifyIdleMs);
-        maybeAutoConfirm(); // sigue respondiendo prompts de permiso mientras tanto
-        return;
-      }
-
-      // Modo normal: deteccion del patron de limite.
-      if (isRateLimited(combined)) {
-        if (!CFG.verify) {
-          // Verificacion desactivada: comportamiento clasico (corte inmediato).
-          confirmLimit();
-          return;
-        }
-        verifyPhase = 'armed';
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = setTimeout(onIdleAfterPattern, CFG.verifyIdleMs);
-        return;
-      }
-      maybeAutoConfirm();
-    });
-    term.onExit(({ exitCode }) => settle({ code: exitCode ?? 0, stdout: '', stderr: '' }));
-  });
-}
-
-// Fallback sin node-pty: cede el control total de la terminal a claude
-// (stdio heredado). El modo interactivo funciona, pero NO podemos leer la salida,
-// asi que no hay deteccion de limite ni reintento en este camino.
-function runClaudeInherit(args) {
-  return new Promise((resolve) => {
-    const child = spawnClaude(args, 'inherit');
-    child.on('error', (e) => {
-      process.stderr.write(`[claude-retry] Error al lanzar claude: ${e.message}\n`);
-      resolve({ code: 1, stdout: '', stderr: '' });
-    });
-    child.on('exit', (code) => resolve({ code: code ?? 0, stdout: '', stderr: '' }));
-  });
-}
-
 // --- Bucle principal ------------------------------------------------------
 async function main() {
-  const baseArgs = process.argv.slice(2);
+  const baseArgs = withAutoPermission(process.argv.slice(2));
 
   let currentArgs = baseArgs;
   let attempt = 0;
@@ -683,6 +401,19 @@ async function main() {
     );
     await sleep(waitMs);
   }
+}
+
+// Respuesta automatica a los permisos en modo -p: si CR_PERMISSION_MODE tiene un
+// valor y el comando no trae ya un --permission-mode (ni --dangerously-skip-permissions),
+// lo anade para que claude no se detenga a pedir permiso para editar/ejecutar.
+function withAutoPermission(args) {
+  if (!CFG.permissionMode) return args;
+  const already =
+    args.includes('--permission-mode') ||
+    args.some((a) => a.startsWith('--permission-mode=')) ||
+    args.includes('--dangerously-skip-permissions');
+  if (already) return args;
+  return [...args, '--permission-mode', CFG.permissionMode];
 }
 
 // Construye los argumentos del reintento. Con CR_CONTINUE_ON_RETRY, anade
@@ -719,15 +450,6 @@ function parsePrecision(v, d) {
   if (!Number.isFinite(n)) return d;
   const frac = n > 1 ? n / 100 : n;
   return Math.min(1, Math.max(0, frac));
-}
-// Interpreta el valor de CR_AUTO_CONFIRM_KEY. Acepta alias ("enter") o un literal
-// ("1", "y") que se envia tal cual al PTY. En la TUI de claude pulsar el numero de
-// una opcion la selecciona y confirma; Enter confirma la opcion por defecto ("Yes").
-function parseKey(v, d) {
-  if (v == null || v === '') return d;
-  const lower = v.toLowerCase();
-  if (lower === 'enter' || lower === 'return' || lower === 'cr') return '\r';
-  return v;
 }
 function resolveClaudeBin() {
   // En Windows el binario suele ser claude.cmd; spawn con shell:true lo resuelve por PATH.

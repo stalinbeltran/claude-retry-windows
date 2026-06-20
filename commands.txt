@@ -1,1 +1,1 @@
-node claude-retry.mjs
+node claude-retry.mjs -p "tu prompt aqui"
