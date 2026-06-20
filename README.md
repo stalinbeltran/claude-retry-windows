@@ -11,12 +11,13 @@ Corre en Node nativo (no necesita `tmux`, `bash` ni dependencias externas).
 
 - **Modo no interactivo** — pensado para `claude -p "..."`: una tarea, claude la
   ejecuta y termina. Sin TUI ni pseudo-terminal.
-- **Streaming en vivo** — la salida de claude (incluidas las preguntas de
-  aclaración) se ve en tiempo real, no al final.
+- **Salida en vivo (passthrough a tu terminal)** — lo que claude escribe en su
+  stdout/stderr se reenvía a tu consola en cuanto llega, no al final. No es
+  streaming de red: es un *passthrough* del proceso hijo a `process.stdout`/`stderr`.
 - **Detección de límite en dos capas** — patrones definitivos + detección
   estadística de variantes no catalogadas (ver abajo).
-- **Detección en vivo** — reacciona a mitad del stream, sin esperar a que el
-  proceso termine.
+- **Detección en vivo** — escanea la salida a medida que llega y reacciona a mitad,
+  sin esperar a que el proceso termine.
 - **Reintento automático** — al detectar un rate limit, calcula cuánto falta para
   el reinicio (con conversión de zona horaria), espera y vuelve a lanzar el comando.
 - **Respuestas automáticas** — reenvío automático del modo de permisos
