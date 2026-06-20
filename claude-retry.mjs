@@ -14,7 +14,7 @@
 //   CR_FALLBACK_HOURS   (def 5)    espera si no se logra parsear la hora de reinicio
 //   CR_CLAUDE_BIN       (def auto) ruta al binario de claude
 
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 
 const CFG = {
   maxRetries: int(process.env.CR_MAX_RETRIES, 5),
@@ -75,27 +75,54 @@ function calculateWaitMs(text) {
 
 // --- Lanzar claude con streaming en vivo ----------------------------------
 // La salida se reenvia a la terminal en cuanto llega (para no romper el modo
-// interactivo ni ocultar preguntas de aclaracion), y en paralelo se acumula
-// SOLO para poder detectar el limite de uso una vez que el proceso termina.
+// interactivo ni ocultar preguntas de aclaracion), y en paralelo se escanea el
+// texto acumulado EN VIVO: en cuanto aparece el patron de limite de uso se mata
+// el proceso y se resuelve, sin esperar al exit. Asi el reintento se dispara
+// aunque la sesion no termine por si sola.
+//
+// Para evitar reaccionar ante un patron partido entre dos chunks, la deteccion
+// se hace sobre una ventana final (cola) del texto combinado.
+const DETECT_WINDOW = 4096; // bytes de cola sobre los que se escanea en vivo
+
 function runClaude(args) {
   return new Promise((resolve) => {
-    const child = spawn(CFG.claudeBin, args, {
+    const child = spawn(CFG.claudeBin, quoteArgsForShell(args), {
       stdio: ['inherit', 'pipe', 'pipe'],
       shell: process.platform === 'win32', // permite resolver claude.cmd en Windows
     });
     const out = [];
     const err = [];
-    child.stdout.on('data', (d) => {
-      process.stdout.write(d); // streaming en vivo
-      out.push(d); // acumula solo para detectar el limite
-    });
-    child.stderr.on('data', (d) => {
-      process.stderr.write(d); // streaming en vivo
-      err.push(d); // acumula solo para detectar el limite
-    });
-    child.on('error', (e) => resolve({ code: 1, stdout: '', stderr: String(e.message) }));
+    let combined = ''; // texto acumulado (ambos streams) para deteccion en vivo
+    let settled = false; // evita resolver dos veces (deteccion en vivo + exit/kill)
+
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    // Acumula el chunk, lo reenvia en vivo y dispara el reintento si detecta limite.
+    const onChunk = (stream, store) => (d) => {
+      stream.write(d); // streaming en vivo
+      store.push(d); // acumula para el resultado final
+      combined += d.toString();
+      if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
+      if (isRateLimited(combined)) {
+        killTree(child); // corta la sesion (y su arbol) para poder reintentar
+        settle({
+          code: 1,
+          stdout: Buffer.concat(out).toString(),
+          stderr: Buffer.concat(err).toString(),
+          rateLimited: true,
+        });
+      }
+    };
+
+    child.stdout.on('data', onChunk(process.stdout, out));
+    child.stderr.on('data', onChunk(process.stderr, err));
+    child.on('error', (e) => settle({ code: 1, stdout: '', stderr: String(e.message) }));
     child.on('exit', (code) =>
-      resolve({
+      settle({
         code: code ?? 1,
         stdout: Buffer.concat(out).toString(),
         stderr: Buffer.concat(err).toString(),
@@ -119,7 +146,8 @@ async function main() {
     const result = await runClaude(args);
     const combined = result.stdout + '\n' + result.stderr;
 
-    if (!isRateLimited(combined)) {
+    // result.rateLimited viene de la deteccion en vivo; si no, se escanea el total.
+    if (!result.rateLimited && !isRateLimited(combined)) {
       // La salida ya se imprimio en vivo durante el streaming.
       process.exit(result.code);
     }
@@ -155,6 +183,38 @@ function num(v, d) {
 function resolveClaudeBin() {
   // En Windows el binario suele ser claude.cmd; spawn con shell:true lo resuelve por PATH.
   return 'claude';
+}
+// Con shell:true en Windows, Node concatena los argumentos SIN entrecomillarlos,
+// asi que un valor con espacios (p. ej. -p "varias palabras") se parte en tokens
+// y claude solo recibe la primera palabra. Aqui entrecomillamos cada argumento
+// que lo necesite para preservar el prompt completo.
+function quoteArgsForShell(args) {
+  if (process.platform !== 'win32') return args;
+  return args.map((a) => {
+    if (a === '') return '""';
+    if (/[\s"&|<>^()%!]/.test(a)) {
+      return '"' + a.replace(/"/g, '\\"') + '"';
+    }
+    return a;
+  });
+}
+// Mata el proceso hijo Y todos sus descendientes.
+// En Windows, con shell:true, child.kill() solo mata el cmd que lo lanzo y deja
+// a claude (y a sus hijos) huerfanos; taskkill /T /F mata el arbol completo.
+function killTree(child) {
+  if (!child || child.pid == null) return;
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {
+      // Si taskkill falla (p. ej. el proceso ya murio), intentamos el kill normal.
+      try {
+        child.kill();
+      } catch {
+        /* ignorado */
+      }
+    });
+  } else {
+    child.kill();
+  }
 }
 
 main();
