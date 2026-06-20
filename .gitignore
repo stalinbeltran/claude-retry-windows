@@ -4,3 +4,5 @@ node_modules/
 .rl-counter
 .rl-counter-*
 *.log
+# salida legible generada por clean-log.mjs (derivada del .log, regenerable)
+session.txt
