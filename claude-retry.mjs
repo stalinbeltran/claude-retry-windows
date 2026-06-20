@@ -16,8 +16,13 @@
 //   CR_AUTO_CONFIRM       (def on)    auto-responde prompts de confirmacion (modo interactivo); CR_AUTO_CONFIRM=0 lo apaga
 //   CR_AUTO_CONFIRM_KEY   (def Enter) tecla a enviar al auto-confirmar ("enter", "1", "y"...)
 //   CR_CONTINUE_ON_RETRY  (def off)   anade --continue al reintentar tras el limite
+//   CR_TRANSCRIPT         (def off)   ruta de archivo donde volcar TODA la salida
+//                                     (util para revisar la sesion completa cuando el
+//                                     scrollback del terminal no conserva el texto que
+//                                     se desborda; p. ej. con winpty en VSCode)
 
 import { spawn, execFile } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 
 const CFG = {
   maxRetries: int(process.env.CR_MAX_RETRIES, 5),
@@ -27,7 +32,30 @@ const CFG = {
   autoConfirm: bool(process.env.CR_AUTO_CONFIRM, true),
   autoConfirmKey: parseKey(process.env.CR_AUTO_CONFIRM_KEY, '\r'),
   continueOnRetry: bool(process.env.CR_CONTINUE_ON_RETRY, false),
+  transcript: process.env.CR_TRANSCRIPT || '',
 };
+
+// --- Transcripcion a archivo (opcional) -----------------------------------
+// Cuando CR_TRANSCRIPT apunta a un archivo, recogemos TODO lo que claude envia a
+// la pantalla (en modo -p y en modo interactivo, incluyendo los reintentos tras
+// el limite) y lo escribimos en bruto. Esto permite revisar la sesion completa
+// aunque la TUI redibuje en vivo y el scrollback del terminal pierda el texto que
+// se desborda (caso tipico de winpty en el terminal de VSCode). El stream se abre
+// una sola vez por invocacion (trunca al inicio y va acumulando los reintentos).
+let _transcript;
+function writeTranscript(data) {
+  if (!CFG.transcript) return;
+  if (_transcript === undefined) {
+    try {
+      _transcript = createWriteStream(CFG.transcript, { flags: 'w' });
+      _transcript.write(`# claude-retry transcript — ${new Date().toISOString()}\n`);
+    } catch (e) {
+      process.stderr.write(`[claude-retry] no se pudo abrir el transcript: ${e.message}\n`);
+      _transcript = null; // marca el fallo para no reintentar abrirlo en cada chunk
+    }
+  }
+  if (_transcript) _transcript.write(data);
+}
 
 // --- Deteccion de limite de uso -------------------------------------------
 // IMPORTANTE: estos patrones se escanean sobre TODA la salida de claude, incluido
@@ -158,6 +186,7 @@ function runClaudePipe(args) {
     const onChunk = (stream, store) => (d) => {
       stream.write(d); // streaming en vivo
       store.push(d); // acumula para el resultado final
+      writeTranscript(d); // copia a archivo si CR_TRANSCRIPT esta activo
       combined += d.toString();
       if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
       if (isRateLimited(combined)) {
@@ -285,6 +314,7 @@ function runClaudePty(pty, args) {
 
     term.onData((d) => {
       process.stdout.write(d); // streaming en vivo (incluye secuencias de la TUI)
+      writeTranscript(d); // copia a archivo si CR_TRANSCRIPT esta activo
       combined += d;
       if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
       if (isRateLimited(combined)) {
