@@ -207,6 +207,52 @@ Salida esperada:
 [fake-claude] intento 2: trabajo completado con exito. TODO OK.
 ```
 
+### Test de detección (sin gastar cuota)
+
+`test-detection.mjs` valida las dos capas de detección y el parseo de la hora de
+reinicio (incluido el caso real que fallaba y casos negativos que **no** deben
+disparar el reintento):
+
+```powershell
+node test-detection.mjs
+# -> RESULTADO: 20 ok, 0 fallos
+```
+
+### Probar todas las variantes end-to-end
+
+`fake-claude-variants.cmd` / `.mjs` emite distintos banners de límite (elige con
+`FAKE_VARIANT`): `real` (el caso `You've hit your session limit · resets 12:30pm
+(America/Panama)`), `usage`, `fivehour`, `weekly`, `notime` y `novel` (una frase
+**no catalogada** que solo detecta la capa estadística). En la 1ª llamada simula el
+límite; en la 2ª responde con éxito.
+
+Bucle completo rápido (detección → espera → reintento → éxito):
+
+```powershell
+Remove-Item .\.rl-counter-* -ErrorAction SilentlyContinue
+$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude-variants.cmd).Path
+$env:FAKE_VARIANT = "notime"
+$env:CR_FALLBACK_HOURS = "0.0009"   # ~3s en vez de horas
+node claude-retry.mjs -p "tarea de prueba"
+Remove-Item Env:CR_CLAUDE_BIN, Env:FAKE_VARIANT, Env:CR_FALLBACK_HOURS
+Remove-Item .\.rl-counter-* -ErrorAction SilentlyContinue
+```
+
+Para ver **cómo** se detecta cada variante (patrón definitivo vs. confianza
+estadística) sin esperar la cuenta atrás real, activa el modo debug y prueba la
+variante que quieras (`real`, `novel`, …):
+
+```powershell
+$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude-variants.cmd).Path
+$env:FAKE_VARIANT = "novel"; $env:CR_DETECT_DEBUG = "1"
+node claude-retry.mjs -p "x"   # Ctrl+C tras ver la línea de detección
+```
+
+```
+[claude-retry][detect] confianza=0.90 umbral=0.70 -> LIMITE | senales: resets-at-time(+0.5), out-of(+0.4)
+[claude-retry] Limite de uso detectado. Esperando 81770s ...
+```
+
 ## Atajo opcional (alias en PowerShell)
 
 Si lo vas a usar seguido, añade una función a tu perfil:
@@ -303,15 +349,23 @@ Para **revertir** si algo sale mal:
 
 ## Cómo detecta el límite
 
-El wrapper escanea la salida combinada (stdout + stderr) contra patrones
-**específicos del mensaje de error real** del CLI, como `usage limit reached`,
-`5-hour limit reached`, `rate_limit_error` (el 429 de la API), etc. Los patrones
-se mantienen estrictos a propósito: frases de uso común (`rate limit`, `try again
-later`, un `429` suelto) provocarían falsos positivos cuando claude las menciona en
-una respuesta normal. Si detecta uno:
+El wrapper escanea la salida combinada (stdout + stderr) en **dos capas**
+(detalladas en [Detección de límite](#detección-de-límite-dos-capas)):
+
+1. **Patrones definitivos** — frases inequívocas del banner real (`usage limit
+   reached`, `You've hit your session limit`, `5-hour limit reached`,
+   `rate_limit_error`, `429 Too Many Requests`…). Cualquier coincidencia dispara el
+   reintento al instante.
+2. **Detección estadística** — para variantes no catalogadas, suma pesos de muchas
+   señales parciales y dispara si la confianza alcanza `CR_DETECTION_PRECISION`. Así
+   se evita depender de una única frase exacta, sin caer en falsos positivos cuando
+   claude menciona "rate limit" o "429" en una respuesta normal.
+
+Cuando detecta el límite:
 
 1. Intenta leer la hora de reinicio del mensaje (formatos como *"reset in 2 hours"*,
-   *"try again at 3pm"*, *"reset at 15:00"*).
+   *"try again at 3pm"*, *"reset at 15:00"*, *"resets 12:30pm (America/Panama)"* —
+   con conversión de zona horaria).
 2. Si la lee, espera hasta esa hora + `CR_MARGIN_SECONDS`.
 3. Si no la lee, espera `CR_FALLBACK_HOURS`.
 4. Reintenta hasta `CR_MAX_RETRIES` veces.
