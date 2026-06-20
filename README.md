@@ -94,12 +94,44 @@ node claude-retry.mjs
 Se fijan **antes** del comando, en la misma sesión de PowerShell. Todas son
 opcionales.
 
-| Variable            | Default | Qué controla                                      |
-|---------------------|---------|---------------------------------------------------|
-| `CR_MAX_RETRIES`    | 5       | reintentos máximos tras detectar el límite        |
-| `CR_MARGIN_SECONDS` | 30      | margen extra tras la hora de reinicio detectada   |
-| `CR_FALLBACK_HOURS` | 5       | espera si no logra leer la hora de reinicio       |
-| `CR_CLAUDE_BIN`     | auto    | ruta a un binario de claude alternativo           |
+| Variable               | Default | Qué controla                                      |
+|------------------------|---------|---------------------------------------------------|
+| `CR_MAX_RETRIES`       | 5       | reintentos máximos tras detectar el límite        |
+| `CR_MARGIN_SECONDS`    | 30      | margen extra tras la hora de reinicio detectada   |
+| `CR_FALLBACK_HOURS`    | 5       | espera si no logra leer la hora de reinicio       |
+| `CR_CLAUDE_BIN`        | auto    | ruta a un binario de claude alternativo           |
+| `CR_AUTO_CONFIRM`      | off     | auto-responde los prompts de confirmación (modo interactivo) |
+| `CR_AUTO_CONFIRM_KEY`  | Enter   | tecla a enviar al auto-confirmar (`enter`, `1`, `y`...) |
+| `CR_CONTINUE_ON_RETRY` | off     | añade `--continue` al reintentar para retomar la conversación |
+
+### Respuestas automáticas
+
+**Auto-confirmar prompts de permiso (modo interactivo).** En una sesión
+interactiva, claude pregunta *"Do you want to proceed?"* antes de ejecutar o
+editar. Con `CR_AUTO_CONFIRM` activado, el wrapper detecta ese prompt y responde
+solo (por defecto pulsa Enter, que elige la opción resaltada *"Yes"*):
+
+```powershell
+$env:CR_AUTO_CONFIRM = "1"
+node claude-retry.mjs        # cada confirmación se acepta automáticamente
+```
+
+> ⚠️ Aprueba **cualquier** confirmación, incluidas operaciones destructivas.
+> Va apagado por defecto. En modo `-p` no hace falta: usa el flag nativo
+> `--permission-mode acceptEdits` (ver Opción 2).
+
+Para enviar otra tecla en vez de Enter (p. ej. seleccionar la opción 1
+explícitamente): `$env:CR_AUTO_CONFIRM_KEY = "1"`.
+
+**Continuar tras el límite.** Por defecto, al reintentar tras un límite el
+wrapper relanza el comando desde cero (se pierde el contexto). Con
+`CR_CONTINUE_ON_RETRY` activado, añade `--continue` en el reintento para que
+claude **retome** la conversación anterior:
+
+```powershell
+$env:CR_CONTINUE_ON_RETRY = "1"
+node claude-retry.mjs -p "tarea larga que podría tocar el límite"
+```
 
 Ejemplo — más reintentos y más margen:
 

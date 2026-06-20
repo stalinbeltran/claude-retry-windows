@@ -9,10 +9,13 @@
 //   node claude-retry.mjs -p "..."  --append-system-prompt "..."   (cualquier flag de claude)
 //
 // Config por variables de entorno (todas opcionales):
-//   CR_MAX_RETRIES      (def 5)    intentos maximos tras detectar limite
-//   CR_MARGIN_SECONDS   (def 30)   segundos extra de margen tras la hora de reinicio
-//   CR_FALLBACK_HOURS   (def 5)    espera si no se logra parsear la hora de reinicio
-//   CR_CLAUDE_BIN       (def auto) ruta al binario de claude
+//   CR_MAX_RETRIES        (def 5)     intentos maximos tras detectar limite
+//   CR_MARGIN_SECONDS     (def 30)    segundos extra de margen tras la hora de reinicio
+//   CR_FALLBACK_HOURS     (def 5)     espera si no se logra parsear la hora de reinicio
+//   CR_CLAUDE_BIN         (def auto)  ruta al binario de claude
+//   CR_AUTO_CONFIRM       (def off)   auto-responde prompts de confirmacion (modo interactivo)
+//   CR_AUTO_CONFIRM_KEY   (def Enter) tecla a enviar al auto-confirmar ("enter", "1", "y"...)
+//   CR_CONTINUE_ON_RETRY  (def off)   anade --continue al reintentar tras el limite
 
 import { spawn, execFile } from 'node:child_process';
 
@@ -21,6 +24,9 @@ const CFG = {
   marginSeconds: int(process.env.CR_MARGIN_SECONDS, 30),
   fallbackHours: num(process.env.CR_FALLBACK_HOURS, 5),
   claudeBin: process.env.CR_CLAUDE_BIN || resolveClaudeBin(),
+  autoConfirm: bool(process.env.CR_AUTO_CONFIRM, false),
+  autoConfirmKey: parseKey(process.env.CR_AUTO_CONFIRM_KEY, '\r'),
+  continueOnRetry: bool(process.env.CR_CONTINUE_ON_RETRY, false),
 };
 
 // --- Deteccion de limite de uso -------------------------------------------
@@ -41,6 +47,20 @@ const RATE_LIMIT_PATTERNS = [
 
 function isRateLimited(text) {
   return RATE_LIMIT_PATTERNS.some((re) => re.test(text));
+}
+
+// --- Deteccion de prompts de permiso/confirmacion -------------------------
+// Solo aplica al modo interactivo (PTY): claude dibuja un prompt con una pregunta
+// "Do you want to ...?" y una lista de opciones donde la 1a ("Yes") aparece
+// resaltada con "❯". En modo -p/--print no hay estos prompts; alli usa los flags
+// nativos --permission-mode acceptEdits o --dangerously-skip-permissions.
+const CONFIRM_PATTERNS = [
+  /Do you want to (proceed|make this edit|create|run|allow|continue)\b/i,
+  /❯\s*1\.\s*Yes\b/, // selector con la opcion por defecto ("Yes") resaltada
+];
+
+function isConfirmPrompt(text) {
+  return CONFIRM_PATTERNS.some((re) => re.test(text));
 }
 
 // --- Parseo de la hora de reinicio ----------------------------------------
@@ -88,6 +108,7 @@ function calculateWaitMs(text) {
 // Para evitar reaccionar ante un patron partido entre dos chunks, la deteccion
 // se hace sobre una ventana final (cola) del texto combinado.
 const DETECT_WINDOW = 4096; // bytes de cola sobre los que se escanea en vivo
+const CONFIRM_COOLDOWN_MS = 1500; // evita re-disparar el auto-confirm sobre el mismo prompt
 
 // Despachador: elige como lanzar claude segun el modo.
 //   - Modo -p/--print  -> tuberias (capturamos la salida, claude no es TUI).
@@ -192,6 +213,7 @@ function runClaudePty(pty, args) {
 
     let combined = '';
     let settled = false;
+    let lastConfirmAt = 0; // marca temporal del ultimo auto-confirm (cooldown)
 
     const stdin = process.stdin;
     const wasRaw = Boolean(stdin.isTTY);
@@ -233,6 +255,21 @@ function runClaudePty(pty, args) {
           /* ignorado */
         }
         settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
+        return;
+      }
+      // Auto-confirmacion de prompts de permiso/confirmacion (opt-in).
+      // El cooldown evita re-disparar mientras el texto del prompt sigue en el buffer.
+      if (
+        CFG.autoConfirm &&
+        Date.now() - lastConfirmAt > CONFIRM_COOLDOWN_MS &&
+        isConfirmPrompt(combined)
+      ) {
+        term.write(CFG.autoConfirmKey);
+        process.stderr.write(
+          '[claude-retry] prompt de confirmacion detectado: respondido automaticamente.\n'
+        );
+        lastConfirmAt = Date.now();
+        combined = ''; // limpia el buffer para no re-disparar sobre el mismo prompt
       }
     });
     term.onExit(({ exitCode }) => settle({ code: exitCode ?? 0, stdout: '', stderr: '' }));
@@ -255,11 +292,12 @@ function runClaudeInherit(args) {
 
 // --- Bucle principal ------------------------------------------------------
 async function main() {
-  const args = process.argv.slice(2);
+  const baseArgs = process.argv.slice(2);
 
+  let currentArgs = baseArgs;
   let attempt = 0;
   while (true) {
-    const result = await runClaude(args);
+    const result = await runClaude(currentArgs);
     const combined = result.stdout + '\n' + result.stderr;
 
     // result.rateLimited viene de la deteccion en vivo; si no, se escanea el total.
@@ -274,6 +312,10 @@ async function main() {
       process.exit(1);
     }
 
+    // En los reintentos tras el limite, retomamos la conversacion en vez de
+    // reiniciarla (si esta habilitado), para no perder el contexto.
+    currentArgs = retryArgs(baseArgs);
+
     const waitMs = calculateWaitMs(combined);
     const when = new Date(Date.now() + waitMs).toLocaleTimeString();
     process.stderr.write(
@@ -282,6 +324,16 @@ async function main() {
     );
     await sleep(waitMs);
   }
+}
+
+// Construye los argumentos del reintento. Con CR_CONTINUE_ON_RETRY, anade
+// --continue para que claude retome la ultima conversacion del directorio en
+// vez de empezar de cero (salvo que ya se haya pasado --continue/--resume).
+function retryArgs(args) {
+  if (!CFG.continueOnRetry) return args;
+  const resume = ['--continue', '-c', '--resume', '-r'];
+  if (args.some((a) => resume.includes(a))) return args;
+  return [...args, '--continue'];
 }
 
 // --- utilidades -----------------------------------------------------------
@@ -295,6 +347,19 @@ function int(v, d) {
 function num(v, d) {
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : d;
+}
+function bool(v, d) {
+  if (v == null || v === '') return d;
+  return /^(1|true|yes|on)$/i.test(v);
+}
+// Interpreta el valor de CR_AUTO_CONFIRM_KEY. Acepta alias ("enter") o un literal
+// ("1", "y") que se envia tal cual al PTY. En la TUI de claude pulsar el numero de
+// una opcion la selecciona y confirma; Enter confirma la opcion por defecto ("Yes").
+function parseKey(v, d) {
+  if (v == null || v === '') return d;
+  const lower = v.toLowerCase();
+  if (lower === 'enter' || lower === 'return' || lower === 'cr') return '\r';
+  return v;
 }
 function resolveClaudeBin() {
   // En Windows el binario suele ser claude.cmd; spawn con shell:true lo resuelve por PATH.
