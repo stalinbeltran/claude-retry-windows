@@ -67,6 +67,9 @@ const RATE_LIMIT_PATTERNS = [
   /usage limit reached/i, // "Claude usage limit reached. Your limit will reset at ..."
   /claude usage limit/i, // variante del banner de suscripcion
   /\b\d+\s*-?\s*hour limit reached/i, // "5-hour limit reached ∙ resets ..."
+  /you'?ve hit your.*usage limit/i,
+  / hit your session limit/i, // "You've hit your session limit"
+  / hit your usage limit/i, // "You've hit your usage limit"
   /you'?ve reached your.*usage limit/i,
   /rate_limit_error/i, // tipo de error en el JSON del 429 de la API
   /\b429\b[^\n]*too many requests/i, // linea explicita de HTTP 429
@@ -190,6 +193,7 @@ function runClaudePipe(args) {
       combined += d.toString();
       if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
       if (isRateLimited(combined)) {
+        process.stdout.write('-----------------------------------------xxxxxxxxx------------------------------');
         killTree(child); // corta la sesion (y su arbol) para poder reintentar
         settle({
           code: 1,
@@ -319,6 +323,7 @@ function runClaudePty(pty, args) {
       if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
       if (isRateLimited(combined)) {
         try {
+          process.stdout.write('-----------------------------------------xxxxxxxxx------------------------------');
           term.kill();
         } catch {
           /* ignorado */
