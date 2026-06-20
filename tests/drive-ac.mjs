@@ -4,6 +4,11 @@
 // claude no trate el envio como un "pegado" (que insertaria el salto de linea como
 // texto en vez de enviar). Mantiene la sesion viva un tiempo y luego mata el arbol.
 import { spawn, execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// El wrapper vive en la raiz del repo (un nivel por encima de tests/).
+const wrapper = join(dirname(fileURLToPath(import.meta.url)), '..', 'claude-retry.mjs');
 
 const PROMPT =
   'Crea un archivo de texto llamado auto-confirm-ok.txt cuyo unico contenido sea ' +
@@ -12,7 +17,7 @@ const PROMPT =
 const env = { ...process.env, CR_AUTO_CONFIRM: '1' };
 // stdin por pipe (asi el wrapper no entra en raw mode y reenvia lo que escribimos);
 // stdout/stderr heredados para que su salida fluya al log que abre PowerShell.
-const child = spawn('node', ['claude-retry.mjs'], { stdio: ['pipe', 'inherit', 'inherit'], env });
+const child = spawn('node', [wrapper], { stdio: ['pipe', 'inherit', 'inherit'], env });
 
 const t = (ms) => new Promise((r) => setTimeout(r, ms));
 

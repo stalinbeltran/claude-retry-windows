@@ -107,6 +107,9 @@ opcionales.
 | `CR_CONTINUE_ON_RETRY`   | off     | añade `--continue` al reintentar para retomar la conversación |
 | `CR_DETECTION_PRECISION` | 70      | precisión requerida (0-100, o 0-1) para la detección **estadística** de variantes no catalogadas |
 | `CR_DETECT_DEBUG`        | off     | imprime la puntuación y las señales que casaron en cada detección |
+| `CR_VERIFY`              | on      | [interactivo] verifica con una sonda antes de asumir el límite (anti falso positivo); `=0` corta de inmediato |
+| `CR_VERIFY_IDLE_MS`      | 1500    | ms que la salida debe estar quieta tras el patrón antes de sondear |
+| `CR_VERIFY_WINDOW_MS`    | 8000    | ms de espera a la respuesta de la sonda antes de decidir |
 
 ### Detección de límite (dos capas)
 
@@ -130,9 +133,35 @@ $env:CR_DETECTION_PRECISION = 85; $env:CR_DETECT_DEBUG = 1
 node claude-retry.mjs ...
 ```
 
-> El test `node test-detection.mjs` valida la detección (incluido el caso real
+> El test `node tests/test-detection.mjs` valida la detección (incluido el caso real
 > `"You've hit your session limit · resets 12:30pm (America/Panama)"`) y el parseo
 > de la hora de reinicio con zona horaria.
+
+### Verificación anti falso positivo (modo interactivo)
+
+El patrón de límite se escanea sobre **toda** la salida de claude, incluido el
+texto normal de la conversación. Eso provoca falsos positivos cuando claude solo
+**menciona** el límite (p. ej. al revisar un proyecto sobre cuotas como este). Para
+evitar cortar la sesión por error, en modo interactivo el wrapper **no mata claude
+de inmediato** al ver el patrón:
+
+1. **Compuerta de inactividad.** Mientras claude siga generando texto, no se hace
+   nada (no se interrumpe una respuesta en curso). Solo cuando la salida lleva
+   `CR_VERIFY_IDLE_MS` quieta tras el patrón se pasa a verificar.
+2. **Sonda.** Se envía un mensaje real (`continue`) para forzar a claude a intentar
+   responder, y se abre una ventana de `CR_VERIFY_WINDOW_MS`:
+   - Si **reaparece el banner** de límite → es real → espera y reintenta.
+   - Si claude **responde con normalidad** → falso positivo → la sesión continúa.
+   - Si **no hay respuesta** a la sonda → se asume límite real (conservador).
+
+Costo: la sonda añade un turno `continue` a la conversación. Desactívalo con
+`CR_VERIFY=0` para volver al corte inmediato. Solo aplica al modo interactivo; en
+`-p` (un solo disparo) se mantiene la detección directa.
+
+> **Limitación conocida:** si una respuesta legítima *repite* el patrón justo
+> mientras se sondea (o la TUI redibuja ese texto), puede confirmarse como límite
+> real. Sube `CR_VERIFY_IDLE_MS`/`CR_VERIFY_WINDOW_MS` o usa `CR_VERIFY=0` si te
+> afecta.
 
 ### Respuestas automáticas
 
@@ -187,13 +216,14 @@ Remove-Item Env:CR_MAX_RETRIES, Env:CR_MARGIN_SECONDS
 
 ## Probar sin gastar cuota
 
-El repositorio incluye un "claude falso" (`fake-claude.cmd` / `fake-claude.mjs`)
-que simula un límite en la 1ª llamada y responde con éxito en la 2ª, para
-experimentar con el ciclo de reintento:
+Los tests y los "claude falsos" viven en la carpeta [`tests/`](tests). El
+repositorio incluye un "claude falso" (`tests/fake-claude.cmd` /
+`tests/fake-claude.mjs`) que simula un límite en la 1ª llamada y responde con
+éxito en la 2ª, para experimentar con el ciclo de reintento:
 
 ```powershell
-Remove-Item .\.rl-counter -ErrorAction SilentlyContinue   # reinicia el contador
-$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude.cmd).Path
+Remove-Item .\tests\.rl-counter -ErrorAction SilentlyContinue   # reinicia el contador
+$env:CR_CLAUDE_BIN = (Resolve-Path .\tests\fake-claude.cmd).Path
 $env:CR_FALLBACK_HOURS = "0.002"                          # espera ~7s en vez de horas
 node claude-retry.mjs -p "tarea de prueba"
 Remove-Item Env:CR_CLAUDE_BIN, Env:CR_FALLBACK_HOURS       # vuelve al claude real
@@ -207,20 +237,29 @@ Salida esperada:
 [fake-claude] intento 2: trabajo completado con exito. TODO OK.
 ```
 
-### Test de detección (sin gastar cuota)
+### Tests automáticos (sin gastar cuota)
 
-`test-detection.mjs` valida las dos capas de detección y el parseo de la hora de
-reinicio (incluido el caso real que fallaba y casos negativos que **no** deben
-disparar el reintento):
+Todos los tests se ejecutan con `npm test` (o cada uno por separado):
 
 ```powershell
-node test-detection.mjs
-# -> RESULTADO: 20 ok, 0 fallos
+npm test                 # detección (unitario) + verificación (e2e por PTY)
+npm run test:detection   # solo node tests/test-detection.mjs
+npm run test:verify      # solo node tests/test-verify.mjs
 ```
+
+`tests/test-detection.mjs` valida las dos capas de detección y el parseo de la hora
+de reinicio (incluido el caso real que fallaba y casos negativos que **no** deben
+disparar el reintento) → `RESULTADO: 20 ok, 0 fallos`.
+
+`tests/test-verify.mjs` es un test **end-to-end**: lanza el wrapper real por PTY
+contra `tests/fake-claude-interactive.cmd` (un claude falso que se mantiene vivo) y
+comprueba los tres caminos de la verificación anti falso positivo: límite real
+(reaparece el banner), falso positivo (responde normal) y `CR_VERIFY=0` (corte
+inmediato) → `RESULTADO E2E: 3 ok, 0 fallos`.
 
 ### Probar todas las variantes end-to-end
 
-`fake-claude-variants.cmd` / `.mjs` emite distintos banners de límite (elige con
+`tests/fake-claude-variants.cmd` / `.mjs` emite distintos banners de límite (elige con
 `FAKE_VARIANT`): `real` (el caso `You've hit your session limit · resets 12:30pm
 (America/Panama)`), `usage`, `fivehour`, `weekly`, `notime` y `novel` (una frase
 **no catalogada** que solo detecta la capa estadística). En la 1ª llamada simula el
@@ -229,13 +268,13 @@ límite; en la 2ª responde con éxito.
 Bucle completo rápido (detección → espera → reintento → éxito):
 
 ```powershell
-Remove-Item .\.rl-counter-* -ErrorAction SilentlyContinue
-$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude-variants.cmd).Path
+Remove-Item .\tests\.rl-counter-* -ErrorAction SilentlyContinue
+$env:CR_CLAUDE_BIN = (Resolve-Path .\tests\fake-claude-variants.cmd).Path
 $env:FAKE_VARIANT = "notime"
 $env:CR_FALLBACK_HOURS = "0.0009"   # ~3s en vez de horas
 node claude-retry.mjs -p "tarea de prueba"
 Remove-Item Env:CR_CLAUDE_BIN, Env:FAKE_VARIANT, Env:CR_FALLBACK_HOURS
-Remove-Item .\.rl-counter-* -ErrorAction SilentlyContinue
+Remove-Item .\tests\.rl-counter-* -ErrorAction SilentlyContinue
 ```
 
 Para ver **cómo** se detecta cada variante (patrón definitivo vs. confianza
@@ -243,7 +282,7 @@ estadística) sin esperar la cuenta atrás real, activa el modo debug y prueba l
 variante que quieras (`real`, `novel`, …):
 
 ```powershell
-$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude-variants.cmd).Path
+$env:CR_CLAUDE_BIN = (Resolve-Path .\tests\fake-claude-variants.cmd).Path
 $env:FAKE_VARIANT = "novel"; $env:CR_DETECT_DEBUG = "1"
 node claude-retry.mjs -p "x"   # Ctrl+C tras ver la línea de detección
 ```
@@ -304,8 +343,8 @@ comando global. Tienes dos formas:
 **a) Sin gastar cuota — con el claude falso** (para validar la lógica de reintento):
 
 ```powershell
-Remove-Item .\.rl-counter -ErrorAction SilentlyContinue
-$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude.cmd).Path
+Remove-Item .\tests\.rl-counter -ErrorAction SilentlyContinue
+$env:CR_CLAUDE_BIN = (Resolve-Path .\tests\fake-claude.cmd).Path
 $env:CR_FALLBACK_HOURS = "0.002"
 node claude-retry.mjs -p "prueba"          # ejecuta la versión EN EDICIÓN del repo
 Remove-Item Env:CR_CLAUDE_BIN, Env:CR_FALLBACK_HOURS
@@ -375,8 +414,18 @@ Cuando detecta el límite:
 | Archivo            | Descripción                                            |
 |--------------------|--------------------------------------------------------|
 | `claude-retry.mjs` | El wrapper.                                             |
-| `package.json`     | Metadatos y dependencia opcional `node-pty`.           |
-| `fake-claude.cmd`  | Lanzador del claude falso para pruebas.                |
-| `fake-claude.mjs`  | Claude falso que simula un rate limit.                 |
+| `package.json`     | Metadatos, scripts de test y dependencia `node-pty`.   |
+| `tests/`           | Tests y "claude falsos" (ver abajo).                   |
 | `app.py`           | Demo: servidor web mínimo con la librería estándar.    |
 | `index.html`       | Demo: página servida por `app.py`.                     |
+
+Dentro de `tests/`:
+
+| Archivo                          | Descripción                                            |
+|----------------------------------|--------------------------------------------------------|
+| `test-detection.mjs`             | Test unitario de la detección de límite y parseo de hora. |
+| `test-verify.mjs`                | Test e2e (por PTY) de la verificación anti falso positivo. |
+| `fake-claude.cmd` / `.mjs`       | Claude falso (un disparo) que simula un rate limit.    |
+| `fake-claude-variants.cmd` / `.mjs` | Claude falso con variantes de banner (`FAKE_VARIANT`). |
+| `fake-claude-interactive.cmd` / `.mjs` | Claude falso interactivo que responde a la sonda (`FAKE_SCENARIO`). |
+| `drive-ac.mjs`                   | Driver manual del auto-confirm (requiere claude real). |

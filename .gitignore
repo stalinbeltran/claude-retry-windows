@@ -1,3 +1,6 @@
 node_modules/
-.rl-counter
 .env
+# artefactos de tests (contadores de los fakes, logs)
+.rl-counter
+.rl-counter-*
+*.log

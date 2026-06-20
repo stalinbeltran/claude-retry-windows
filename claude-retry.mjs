@@ -28,6 +28,16 @@
 //                                     variantes debiles); mas bajo = mas sensible.
 //   CR_DETECT_DEBUG       (def off)   imprime en stderr la puntuacion y las senales que
 //                                     casaron en cada deteccion (para ajustar la precision)
+//   CR_VERIFY             (def on)    [solo modo interactivo] al ver un patron de limite NO
+//                                     mata la sesion de inmediato: espera a que la salida se
+//                                     calme y envia una sonda ("continue") para comprobar si
+//                                     el limite es real. Asi evita falsos positivos cuando
+//                                     claude solo MENCIONA el limite (p. ej. revisando codigo
+//                                     sobre cuotas). CR_VERIFY=0 restaura el corte inmediato.
+//   CR_VERIFY_IDLE_MS     (def 1500)  ms que la salida debe estar quieta TRAS el patron antes
+//                                     de enviar la sonda (no interrumpe una respuesta en curso)
+//   CR_VERIFY_WINDOW_MS   (def 8000)  ms de espera a la respuesta de la sonda. Si reaparece el
+//                                     banner -> limite real; si responde normal -> falso positivo
 
 import { spawn, execFile } from 'node:child_process';
 import { createWriteStream, readFileSync } from 'node:fs';
@@ -72,7 +82,16 @@ const CFG = {
   transcript: process.env.CR_TRANSCRIPT || '',
   detectionPrecision: parsePrecision(process.env.CR_DETECTION_PRECISION, 0.7),
   detectDebug: bool(process.env.CR_DETECT_DEBUG, false),
+  verify: bool(process.env.CR_VERIFY, true),
+  verifyIdleMs: int(process.env.CR_VERIFY_IDLE_MS, 1500),
+  verifyWindowMs: int(process.env.CR_VERIFY_WINDOW_MS, 8000),
 };
+
+// Texto de la sonda de verificacion (modo interactivo). Se escribe en el PTY como
+// un turno real del usuario para forzar a claude a INTENTAR responder: si la cuota
+// esta agotada re-muestra el banner (limite real); si no, responde con normalidad
+// (falso positivo). El '\r' final envia el mensaje.
+const VERIFY_PROBE = 'continue';
 
 // --- Transcripcion a archivo (opcional) -----------------------------------
 // Cuando CR_TRANSCRIPT apunta a un archivo, recogemos TODO lo que claude envia a
@@ -449,6 +468,14 @@ function runClaudePty(pty, args) {
     let settled = false;
     let lastConfirmAt = 0; // marca temporal del ultimo auto-confirm (cooldown)
     let confirmTimer = null; // re-chequeo programado mientras dura el cooldown
+    // Verificacion de limite (anti falso positivo). Fases:
+    //   'normal'    -> deteccion normal
+    //   'armed'     -> se vio el patron; esperando a que la salida se calme (idle)
+    //   'verifying' -> sonda enviada; esperando veredicto (banner real vs respuesta)
+    let verifyPhase = 'normal';
+    let idleTimer = null; // dispara la sonda cuando la salida lleva CFG.verifyIdleMs quieta
+    let verifyTimer = null; // cierra la ventana de verificacion
+    let sawDataInVerify = false; // hubo salida tras la sonda
 
     const stdin = process.stdin;
     const wasRaw = Boolean(stdin.isTTY);
@@ -457,6 +484,8 @@ function runClaudePty(pty, args) {
 
     const cleanup = () => {
       if (confirmTimer) clearTimeout(confirmTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (verifyTimer) clearTimeout(verifyTimer);
       stdin.removeListener('data', onStdin);
       process.stdout.removeListener('resize', onResize);
       if (wasRaw) {
@@ -507,18 +536,97 @@ function runClaudePty(pty, args) {
     stdin.on('data', onStdin);
     process.stdout.on('resize', onResize);
 
+    // Confirma el limite como REAL: corta la sesion para que el bucle reintente.
+    const confirmLimit = () => {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      if (verifyTimer) { clearTimeout(verifyTimer); verifyTimer = null; }
+      try {
+        term.kill();
+      } catch {
+        /* ignorado */
+      }
+      settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
+    };
+
+    // Falso positivo: claude solo mencionaba el limite (o respondio normal a la
+    // sonda). Volvemos a modo normal sin matar la sesion.
+    const dismissAsFalsePositive = (reason) => {
+      verifyPhase = 'normal';
+      combined = '';
+      if (CFG.detectDebug) {
+        process.stderr.write(`[claude-retry][verify] falso positivo (${reason}): se continua la sesion.\n`);
+      }
+    };
+
+    // Fin de la inactividad tras ver el patron: la salida se calmo, asi que enviamos
+    // la sonda y abrimos la ventana de verificacion. Si la verificacion esta
+    // desactivada (CR_VERIFY=0) este camino no se usa: se corta de inmediato.
+    const onIdleAfterPattern = () => {
+      idleTimer = null;
+      if (settled) return;
+      verifyPhase = 'verifying';
+      sawDataInVerify = false;
+      combined = ''; // descarta el texto que disparo la sospecha; solo miramos lo nuevo
+      process.stderr.write(
+        '[claude-retry] posible limite detectado: verificando con una sonda ("continue")...\n'
+      );
+      try { term.write(VERIFY_PROBE); } catch { /* ignorado */ }
+      // Pequena pausa antes del Enter por si la TUI hace autocompletado/bracketed paste.
+      setTimeout(() => {
+        if (settled) return;
+        try { term.write('\r'); } catch { /* ignorado */ }
+      }, 60);
+      verifyTimer = setTimeout(() => {
+        verifyTimer = null;
+        if (verifyPhase !== 'verifying') return;
+        // La ventana se cerro sin que reapareciera el banner.
+        if (!sawDataInVerify) {
+          // Silencio total: una sesion sana responde a "continue"; si no llega nada
+          // asumimos limite real (conservador).
+          process.stderr.write('[claude-retry] sin respuesta a la sonda: se asume limite real.\n');
+          confirmLimit();
+        } else {
+          process.stderr.write('[claude-retry] la sesion respondio sin banner: falso positivo, se continua.\n');
+          dismissAsFalsePositive('respuesta-normal');
+        }
+      }, CFG.verifyWindowMs);
+    };
+
     term.onData((d) => {
       process.stdout.write(d); // streaming en vivo (incluye secuencias de la TUI)
       writeTranscript(d); // copia a archivo si CR_TRANSCRIPT esta activo
       combined += d;
       if (combined.length > DETECT_WINDOW) combined = combined.slice(-DETECT_WINDOW);
-      if (isRateLimited(combined)) {
-        try {
-          term.kill();
-        } catch {
-          /* ignorado */
+
+      // Ventana de verificacion abierta: solo nos interesa si REAPARECE el banner.
+      if (verifyPhase === 'verifying') {
+        sawDataInVerify = true;
+        if (isRateLimited(combined)) {
+          process.stderr.write('[claude-retry] el banner de limite reaparecio tras la sonda: limite real.\n');
+          confirmLimit();
         }
-        settle({ code: 1, stdout: '', stderr: '', rateLimited: true });
+        return;
+      }
+
+      // Patron ya visto: esperamos a que la salida se calme. Cada chunk nuevo
+      // reinicia el contador de inactividad (no interrumpimos una respuesta en curso).
+      if (verifyPhase === 'armed') {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(onIdleAfterPattern, CFG.verifyIdleMs);
+        maybeAutoConfirm(); // sigue respondiendo prompts de permiso mientras tanto
+        return;
+      }
+
+      // Modo normal: deteccion del patron de limite.
+      if (isRateLimited(combined)) {
+        if (!CFG.verify) {
+          // Verificacion desactivada: comportamiento clasico (corte inmediato).
+          confirmLimit();
+          return;
+        }
+        verifyPhase = 'armed';
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(onIdleAfterPattern, CFG.verifyIdleMs);
         return;
       }
       maybeAutoConfirm();

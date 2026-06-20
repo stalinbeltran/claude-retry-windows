@@ -8,7 +8,10 @@
   },
   "scripts": {
     "start": "node claude-retry.mjs",
-    "promote": "npm install -g ."
+    "promote": "npm install -g .",
+    "test": "node tests/test-detection.mjs && node tests/test-verify.mjs",
+    "test:detection": "node tests/test-detection.mjs",
+    "test:verify": "node tests/test-verify.mjs"
   },
   "dependencies": {
     "node-pty": "^1.0.0"

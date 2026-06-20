@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Test de la deteccion de limite de uso. Ejecuta:  node test-detection.mjs
+// Test de la deteccion de limite de uso. Ejecuta:  node tests/test-detection.mjs
 // Cubre el caso real que fallo y un abanico de variantes + casos negativos
 // (texto normal que NO debe disparar el reintento).
 
-import { isRateLimited, rateLimitConfidence, parseResetMs } from './claude-retry.mjs';
+import { isRateLimited, rateLimitConfidence, parseResetMs } from '../claude-retry.mjs';
 
 let pass = 0;
 let fail = 0;
