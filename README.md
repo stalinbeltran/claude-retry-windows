@@ -91,18 +91,48 @@ node claude-retry.mjs
 
 ## Configuración (variables de entorno)
 
-Se fijan **antes** del comando, en la misma sesión de PowerShell. Todas son
+Se fijan **antes** del comando, en la misma sesión de PowerShell, **o en un
+archivo `.env`** en el directorio de trabajo (se carga automáticamente; las
+variables ya presentes en el entorno tienen prioridad sobre el `.env`). Todas son
 opcionales.
 
-| Variable               | Default | Qué controla                                      |
-|------------------------|---------|---------------------------------------------------|
-| `CR_MAX_RETRIES`       | 5       | reintentos máximos tras detectar el límite        |
-| `CR_MARGIN_SECONDS`    | 30      | margen extra tras la hora de reinicio detectada   |
-| `CR_FALLBACK_HOURS`    | 5       | espera si no logra leer la hora de reinicio       |
-| `CR_CLAUDE_BIN`        | auto    | ruta a un binario de claude alternativo           |
-| `CR_AUTO_CONFIRM`      | on      | auto-responde los prompts de confirmación (modo interactivo); `=0` lo apaga |
-| `CR_AUTO_CONFIRM_KEY`  | Enter   | tecla a enviar al auto-confirmar (`enter`, `1`, `y`...) |
-| `CR_CONTINUE_ON_RETRY` | off     | añade `--continue` al reintentar para retomar la conversación |
+| Variable                 | Default | Qué controla                                      |
+|--------------------------|---------|---------------------------------------------------|
+| `CR_MAX_RETRIES`         | 5       | reintentos máximos tras detectar el límite        |
+| `CR_MARGIN_SECONDS`      | 30      | margen extra tras la hora de reinicio detectada   |
+| `CR_FALLBACK_HOURS`      | 5       | espera si no logra leer la hora de reinicio       |
+| `CR_CLAUDE_BIN`          | auto    | ruta a un binario de claude alternativo           |
+| `CR_AUTO_CONFIRM`        | on      | auto-responde los prompts de confirmación (modo interactivo); `=0` lo apaga |
+| `CR_AUTO_CONFIRM_KEY`    | Enter   | tecla a enviar al auto-confirmar (`enter`, `1`, `y`...) |
+| `CR_CONTINUE_ON_RETRY`   | off     | añade `--continue` al reintentar para retomar la conversación |
+| `CR_DETECTION_PRECISION` | 70      | precisión requerida (0-100, o 0-1) para la detección **estadística** de variantes no catalogadas |
+| `CR_DETECT_DEBUG`        | off     | imprime la puntuación y las señales que casaron en cada detección |
+
+### Detección de límite (dos capas)
+
+El límite se detecta de dos formas complementarias:
+
+1. **Patrones definitivos** — frases inequívocas del banner real (`usage limit
+   reached`, `You've hit your session limit`, `5-hour limit reached`,
+   `rate_limit_error`, `429 Too Many Requests`, etc.). Si una casa, dispara el
+   reintento de inmediato. Cubren todas las variantes conocidas.
+2. **Detección estadística** — para frases **nuevas/no catalogadas**, suma pesos de
+   muchas señales parciales (`session limit`, `hit your … limit`, `resets <hora>`,
+   `/upgrade`, `quota exceeded`, …) y obtiene una confianza `0..1`. Si alcanza el
+   umbral `CR_DETECTION_PRECISION`, dispara el reintento.
+
+`CR_DETECTION_PRECISION` es ese umbral: más alto = más estricto (menos falsos
+positivos, puede perder variantes débiles); más bajo = más sensible. Acepta tanto
+`85` como `0.85`. Usa `CR_DETECT_DEBUG=1` para ver la confianza y calibrarla:
+
+```powershell
+$env:CR_DETECTION_PRECISION = 85; $env:CR_DETECT_DEBUG = 1
+node claude-retry.mjs ...
+```
+
+> El test `node test-detection.mjs` valida la detección (incluido el caso real
+> `"You've hit your session limit · resets 12:30pm (America/Panama)"`) y el parseo
+> de la hora de reinicio con zona horaria.
 
 ### Respuestas automáticas
 

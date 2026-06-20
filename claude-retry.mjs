@@ -20,9 +20,46 @@
 //                                     (util para revisar la sesion completa cuando el
 //                                     scrollback del terminal no conserva el texto que
 //                                     se desborda; p. ej. con winpty en VSCode)
+//   CR_DETECTION_PRECISION (def 70)   precision requerida (0-100, o 0-1) para la
+//                                     deteccion ESTADISTICA de limites no catalogados.
+//                                     Es el umbral de confianza minimo para disparar el
+//                                     reintento por puntuacion ponderada. Mas alto = mas
+//                                     estricto (menos falsos positivos, puede perder
+//                                     variantes debiles); mas bajo = mas sensible.
+//   CR_DETECT_DEBUG       (def off)   imprime en stderr la puntuacion y las senales que
+//                                     casaron en cada deteccion (para ajustar la precision)
 
 import { spawn, execFile } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+// Carga variables desde un archivo .env (en el cwd) sin dependencias externas.
+// No sobreescribe variables ya presentes en el entorno. Permite configurar p. ej.
+// CR_DETECTION_PRECISION=85 sin tener que exportarla a mano en cada sesion.
+function loadDotEnv() {
+  let txt;
+  try {
+    txt = readFileSync('.env', 'utf8');
+  } catch {
+    return; // no hay .env: nada que cargar
+  }
+  for (const raw of txt.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    if (key && !(key in process.env)) process.env[key] = val;
+  }
+}
+loadDotEnv();
 
 const CFG = {
   maxRetries: int(process.env.CR_MAX_RETRIES, 5),
@@ -33,6 +70,8 @@ const CFG = {
   autoConfirmKey: parseKey(process.env.CR_AUTO_CONFIRM_KEY, '\r'),
   continueOnRetry: bool(process.env.CR_CONTINUE_ON_RETRY, false),
   transcript: process.env.CR_TRANSCRIPT || '',
+  detectionPrecision: parsePrecision(process.env.CR_DETECTION_PRECISION, 0.7),
+  detectDebug: bool(process.env.CR_DETECT_DEBUG, false),
 };
 
 // --- Transcripcion a archivo (opcional) -----------------------------------
@@ -59,22 +98,98 @@ function writeTranscript(data) {
 
 // --- Deteccion de limite de uso -------------------------------------------
 // IMPORTANTE: estos patrones se escanean sobre TODA la salida de claude, incluido
-// el texto normal de la conversacion. Por eso deben ser especificos del MENSAJE DE
-// ERROR real del CLI y no frases de uso comun. Patrones amplios como /rate limit/i
-// o /try again later/i producen falsos positivos (claude mencionando esos terminos
-// en una respuesta normal dispara una espera de horas que no corresponde).
-const RATE_LIMIT_PATTERNS = [
+// el texto normal de la conversacion. La deteccion tiene DOS capas:
+//
+//   1) PATRONES DEFINITIVOS (STRONG_PATTERNS): frases inequivocas del banner de
+//      error real del CLI/API. Si cualquiera casa -> limite, sin mas analisis.
+//
+//   2) DETECCION ESTADISTICA (rateLimitConfidence): para variantes NO catalogadas,
+//      suma pesos de muchas "senales" parciales y obtiene una confianza 0..1. Si la
+//      confianza alcanza el umbral CR_DETECTION_PRECISION -> limite. Asi una frase
+//      nueva como "You've hit your session limit · resets 12:30pm" se detecta por la
+//      combinacion de senales (hit your limit + session limit + resets+hora + upgrade)
+//      aunque ningun patron definitivo la describa palabra por palabra.
+//
+// Subir la precision = exigir mas evidencia (menos falsos positivos). Bajarla = mas
+// sensible (capta variantes mas debiles, con mas riesgo de falso positivo).
+
+// Capa 1: frases definitivas. Cubren todas las variantes conocidas del limite,
+// tanto de la suscripcion (session/usage/weekly/5-hour) como de la API (429).
+const STRONG_PATTERNS = [
   /usage limit reached/i, // "Claude usage limit reached. Your limit will reset at ..."
-  /claude usage limit/i, // variante del banner de suscripcion
+  /claude usage limit/i, // banner clasico de suscripcion
   /\b\d+\s*-?\s*hour limit reached/i, // "5-hour limit reached ∙ resets ..."
-  /you'?ve reached your.*usage limit/i,
+  /\b(?:session|weekly|daily|account|message|opus|plan)\s+limit\s+reached/i,
+  /you'?ve\s+(?:hit|reached|used up|exceeded)\s+your\b[^.\n]{0,40}\blimit/i, // "You've hit your session limit"
+  /\b(?:hit|reached|exceeded)\s+your\s+(?:session|usage|weekly|daily|account|message|plan)\s+limit/i,
+  /your\s+limit\s+will\s+reset/i, // "Your limit will reset at ..."
+  /upgrade\s+to\s+increase\s+your\s+usage\s+limit/i, // pie del banner de limite
   /rate_limit_error/i, // tipo de error en el JSON del 429 de la API
   /\b429\b[^\n]*too many requests/i, // linea explicita de HTTP 429
   /too many requests[^\n]*\b429\b/i,
 ];
 
+// Capa 2: senales ponderadas para deteccion estadistica de variantes nuevas.
+// Cada senal aporta su peso a la confianza (que se satura en 1.0). Los pesos estan
+// calibrados para que una sola senal ambigua ("rate limit" suelto en una respuesta
+// normal) NO alcance el umbral por defecto, pero la combinacion de varias (el patron
+// real de un banner de limite) lo supere con holgura.
+const WEIGHTED_SIGNALS = [
+  { name: 'limit-reached', weight: 0.6, re: /\blimit\s+reached\b/i },
+  { name: 'limit-will-reset', weight: 0.7, re: /\blimit\b[^.\n]{0,30}\breset/i },
+  { name: 'session-limit', weight: 0.55, re: /\bsession\s+limit\b/i },
+  { name: 'usage-limit', weight: 0.55, re: /\busage\s+limit\b/i },
+  { name: 'rate-limit', weight: 0.45, re: /\brate[\s_-]?limit\b/i },
+  { name: 'weekly-daily-limit', weight: 0.55, re: /\b(?:weekly|daily|monthly|plan|account)\s+limit\b/i },
+  { name: 'hour-limit', weight: 0.6, re: /\b\d+\s*-?\s*hour\s+limit\b/i },
+  { name: 'hit-reached-your', weight: 0.55, re: /\b(?:hit|reached|exceeded|used\s+up)\s+your\b[^.\n]{0,40}\blimit/i },
+  { name: 'resets-at-time', weight: 0.5, re: /\breset[s]?\b[^.\n]{0,24}?\b\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/i },
+  { name: 'upgrade', weight: 0.4, re: /\/upgrade\b|\bupgrade\s+(?:to|your)\b/i },
+  { name: 'too-many-requests', weight: 0.45, re: /\btoo many requests\b/i },
+  { name: 'http-429', weight: 0.35, re: /\b429\b/ },
+  { name: 'quota-exceeded', weight: 0.55, re: /\bquota\b[^.\n]{0,20}\b(?:exceed|reached|exhaust)/i },
+  { name: 'out-of', weight: 0.4, re: /\bout of\b[^.\n]{0,20}\b(?:usage|credits?|messages?|tokens?|quota)\b/i },
+  { name: 'try-again-later', weight: 0.3, re: /\btry again (?:later|in|at)\b/i },
+  { name: 'come-back', weight: 0.35, re: /\b(?:come back|check back|available again)\b[^.\n]{0,20}\b(?:later|in|at|reset)/i },
+  { name: 'limit-of-your-plan', weight: 0.5, re: /\blimit\b[^.\n]{0,20}\b(?:plan|subscription|tier)\b/i },
+];
+
+// Calcula la confianza estadistica (0..1) de que el texto sea un mensaje de limite,
+// junto con la lista de senales que casaron (para depuracion). La confianza se satura
+// en 1.0 por mas senales que sumen.
+function rateLimitConfidence(text) {
+  let score = 0;
+  const matched = [];
+  for (const sig of WEIGHTED_SIGNALS) {
+    if (sig.re.test(text)) {
+      score += sig.weight;
+      matched.push(`${sig.name}(+${sig.weight})`);
+    }
+  }
+  return { score: Math.min(score, 1), matched };
+}
+
+// Decision final de deteccion (capa 1 OR capa 2). Devuelve true si hay limite.
+// Si CR_DETECT_DEBUG esta activo, registra por que (patron definitivo o puntuacion).
 function isRateLimited(text) {
-  return RATE_LIMIT_PATTERNS.some((re) => re.test(text));
+  for (const re of STRONG_PATTERNS) {
+    if (re.test(text)) {
+      if (CFG.detectDebug) {
+        process.stderr.write(`[claude-retry][detect] patron definitivo: ${re}\n`);
+      }
+      return true;
+    }
+  }
+  const { score, matched } = rateLimitConfidence(text);
+  const hit = score >= CFG.detectionPrecision;
+  if (CFG.detectDebug && (hit || matched.length)) {
+    process.stderr.write(
+      `[claude-retry][detect] confianza=${score.toFixed(2)} ` +
+        `umbral=${CFG.detectionPrecision.toFixed(2)} -> ${hit ? 'LIMITE' : 'no'} ` +
+        `| senales: ${matched.join(', ') || '(ninguna)'}\n`
+    );
+  }
+  return hit;
 }
 
 // --- Deteccion de prompts de permiso/confirmacion -------------------------
@@ -102,25 +217,54 @@ function isConfirmPrompt(text) {
 }
 
 // --- Parseo de la hora de reinicio ----------------------------------------
-// Soporta: "resets at 3pm", "reset at 15:00", "try again at 4:30 PM",
-//          "reset in 2 hours", "try again in 45 minutes".
+// Soporta:
+//   "resets at 3pm", "reset at 15:00", "try again at 4:30 PM"   (con "at")
+//   "resets 12:30pm", "resets 3pm (America/Panama)"             (sin "at" + TZ)
+//   "reset in 2 hours", "try again in 45 minutes"               (duracion relativa)
+// Si el banner trae una zona horaria IANA entre parentesis (p. ej. "(America/Panama)")
+// la hora se interpreta EN ESA ZONA y se convierte al instante real, para no esperar
+// de mas/menos cuando la maquina esta en otro huso.
 function parseResetMs(text) {
   // 1) "in X hours / minutes"
-  let m = text.match(/(?:reset|try again)\D{0,20}?in\s+(\d+)\s*(hour|hr|minute|min)/i);
+  let m = text.match(
+    /(?:reset[s]?|try again|expires?|available again)\D{0,24}?in\s+(\d+)\s*(hour|hr|minute|min)/i
+  );
   if (m) {
     const n = parseInt(m[1], 10);
     const unit = m[2].toLowerCase();
-    const ms = unit.startsWith('h') ? n * 3600e3 : n * 60e3;
-    return ms;
+    return unit.startsWith('h') ? n * 3600e3 : n * 60e3;
   }
-  // 2) "at 3pm" / "at 15:00" / "at 4:30 PM"
-  m = text.match(/(?:reset|try again)\D{0,20}?at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+
+  // Zona horaria opcional: "(America/Panama)", "(Europe/Madrid)", etc.
+  const tzMatch = text.match(/\(([A-Za-z]+(?:\/[A-Za-z_]+)+)\)/);
+  const tz = tzMatch ? tzMatch[1] : null;
+
+  // 2) hora absoluta. Aceptamos "at"/"by" opcionales; cuando NO hay "at" exigimos
+  //    am/pm o minutos (HH:MM) para no confundir con cualquier numero suelto.
+  //    a) con am/pm:  "resets 12:30pm", "reset at 3 PM"
+  m = text.match(
+    /(?:reset[s]?|try again|expires?|available again)\b[^0-9\n]{0,24}?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i
+  );
+  //    b) 24h con minutos: "reset at 15:00", "resets 09:30"
+  if (!m) {
+    m = text.match(
+      /(?:reset[s]?|try again|expires?|available again)\b[^0-9\n]{0,24}?(\d{1,2}):(\d{2})\b/i
+    );
+    if (m) m = [m[0], m[1], m[2], undefined]; // normaliza a [full, hh, mm, ap]
+  }
   if (m) {
     let hour = parseInt(m[1], 10);
     const minute = m[2] ? parseInt(m[2], 10) : 0;
     const ap = m[3] ? m[3].toLowerCase() : null;
     if (ap === 'pm' && hour < 12) hour += 12;
     if (ap === 'am' && hour === 12) hour = 0;
+    if (hour > 23 || minute > 59) return null; // hora invalida -> fallback
+
+    if (tz) {
+      const ms = zonedFutureMs(hour, minute, tz);
+      if (ms != null) return ms;
+      // TZ no soportada por el runtime: caemos a hora local.
+    }
     const now = new Date();
     const target = new Date(now);
     target.setHours(hour, minute, 0, 0);
@@ -128,6 +272,57 @@ function parseResetMs(text) {
     return target.getTime() - now.getTime();
   }
   return null; // no se pudo parsear
+}
+
+// Devuelve cuantos ms faltan para la PROXIMA ocurrencia de la hora de pared
+// hour:minute en la zona horaria IANA `tz`. Devuelve null si la zona no es valida
+// para el runtime (Intl no la reconoce). Refina el offset una vez para respetar DST.
+function zonedFutureMs(hour, minute, tz) {
+  try {
+    const now = new Date();
+    // Offset (ms) de la zona en un instante dado: tz_wallclock = utc + offset.
+    const offsetAt = (date) => {
+      const dtf = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      });
+      const p = {};
+      for (const part of dtf.formatToParts(date)) p[part.type] = part.value;
+      const h = p.hour === '24' ? 0 : p.hour; // algunos runtimes devuelven 24
+      const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +h, +p.minute, +p.second);
+      return asUTC - date.getTime();
+    };
+    // Fecha de calendario "hoy" en la zona.
+    const dp = {};
+    for (const part of new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(now)) {
+      dp[part.type] = part.value;
+    }
+    const instantFor = (y, mo, d) => {
+      const wall = Date.UTC(y, mo - 1, d, hour, minute, 0);
+      let off = offsetAt(new Date(wall - 0));
+      let inst = wall - off;
+      off = offsetAt(new Date(inst)); // refina (cruces de DST)
+      return wall - off;
+    };
+    let inst = instantFor(+dp.year, +dp.month, +dp.day);
+    if (inst <= now.getTime()) {
+      // Ya paso hoy en esa zona: usa el dia siguiente (en la zona).
+      const tomorrow = new Date(now.getTime() + 24 * 3600e3);
+      const tp = {};
+      for (const part of new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).formatToParts(tomorrow)) {
+        tp[part.type] = part.value;
+      }
+      inst = instantFor(+tp.year, +tp.month, +tp.day);
+    }
+    return inst - now.getTime();
+  } catch {
+    return null; // zona no reconocida
+  }
 }
 
 function calculateWaitMs(text) {
@@ -408,6 +603,15 @@ function bool(v, d) {
   if (v == null || v === '') return d;
   return /^(1|true|yes|on)$/i.test(v);
 }
+// Interpreta CR_DETECTION_PRECISION. Acepta 0..1 (0.85) o 0..100 (85, "85%") y lo
+// normaliza al rango 0..1. Valores fuera de rango se acotan; vacio/invalido -> default.
+function parsePrecision(v, d) {
+  if (v == null || v === '') return d;
+  const n = parseFloat(String(v).replace('%', '').trim());
+  if (!Number.isFinite(n)) return d;
+  const frac = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, frac));
+}
 // Interpreta el valor de CR_AUTO_CONFIRM_KEY. Acepta alias ("enter") o un literal
 // ("1", "y") que se envia tal cual al PTY. En la TUI de claude pulsar el numero de
 // una opcion la selecciona y confirma; Enter confirma la opcion por defecto ("Yes").
@@ -474,4 +678,12 @@ function killTree(child) {
   }
 }
 
-main();
+// Exporta las funciones de deteccion/parseo para poder probarlas de forma aislada
+// (p. ej. desde un test) sin lanzar claude.
+export { isRateLimited, rateLimitConfidence, parseResetMs, calculateWaitMs, parsePrecision };
+
+// Solo arranca el bucle cuando el script se ejecuta directamente (no al importarlo
+// como modulo en un test).
+const invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) main();
