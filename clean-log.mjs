@@ -29,6 +29,7 @@
 //                 (por defecto se descarta, p. ej. el mensaje "Resume this session...")
 
 import { readFileSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 // @xterm/headless se publica como CommonJS: importamos el default y extraemos Terminal.
 import xterm from '@xterm/headless';
 const { Terminal } = xterm;
@@ -64,32 +65,66 @@ function trimTrailingClear(data) {
   return data;
 }
 
+// Lee el buffer activo del emulador como texto. Con onlyViewport=true devuelve solo
+// las ultimas `rows` lineas (lo que se ve en pantalla); si no, devuelve scrollback +
+// viewport completo. translateToString(true) recorta el relleno de espacios del final.
+function readBuffer(term, rows, onlyViewport) {
+  const buf = term.buffer.active;
+  const start = onlyViewport ? Math.max(0, buf.length - rows) : 0;
+  const lines = [];
+  for (let i = start; i < buf.length; i++) {
+    const line = buf.getLine(i);
+    lines.push(line ? line.translateToString(true) : '');
+  }
+  return lines.join('\n');
+}
+
+// Frontera de "frame": secuencias con las que la TUI vuelve arriba para REPINTAR la
+// region visible — cursor-up (\x1b[<N>A), home (\x1b[H / \x1b[1;1H) o borrado total
+// (\x1b[2J). Conservamos el delimitador al inicio de cada segmento para no perder bytes.
+const FRAME_BOUNDARY = /(\x1b\[\d{0,3}A|\x1b\[H|\x1b\[1;1H|\x1b\[2J)/;
+
+// Renderiza el transcript a texto reconstruyendo TODA la conversacion.
+//
+// Problema: la TUI de claude no hace scroll real; repinta su region "en el sitio"
+// subiendo el cursor (\x1b[<N>A) y reescribiendo cada linea. Por eso el emulador
+// nunca manda el historial al scrollback: cada frame sobreescribe al anterior y, al
+// final, el buffer solo contiene el ULTIMO frame visible (la ultima parte de la
+// conversacion). Leer solo el buffer final pierde todo lo anterior.
+//
+// Solucion: alimentamos los bytes a un solo emulador persistente, pero partimos el
+// stream en sus frames y, tras aplicar cada uno, tomamos un snapshot del viewport
+// ANTES de que el siguiente lo sobreescriba. Concatenando los snapshots en orden
+// (mas un volcado final del buffer completo, por si hubo scroll real) y dejando que
+// la de-duplicacion colapse las lineas repetidas entre frames, se reconstruye la
+// conversacion entera, no solo lo ultimo visible.
 function renderToText(data, { cols, rows }) {
-  return new Promise((resolve) => {
-    const term = new Terminal({
-      cols,
-      rows,
-      // Scrollback enorme: queremos conservar TODA la conversacion que se desplazo
-      // fuera de la pantalla durante la sesion, no solo lo ultimo visible.
-      scrollback: 100000,
-      allowProposedApi: true,
-      logLevel: 'off', // silencia los "Parsing error" del parser ante secuencias raras
-    });
-    // write() procesa los datos de forma asincrona; el callback se dispara cuando
-    // el emulador ha aplicado todas las secuencias.
-    term.write(data, () => {
-      const buf = term.buffer.active;
-      const lines = [];
-      // buf.length incluye scrollback + viewport: recorremos todo de arriba abajo.
-      for (let i = 0; i < buf.length; i++) {
-        const line = buf.getLine(i);
-        // translateToString(true) recorta los espacios de relleno del final de cada
-        // linea (la TUI rellena con espacios al repintar).
-        lines.push(line ? line.translateToString(true) : '');
-      }
-      resolve(lines.join('\n'));
-    });
+  const term = new Terminal({
+    cols,
+    rows,
+    // Scrollback enorme: conserva el historial que SI llegue a desplazarse de verdad.
+    scrollback: 100000,
+    allowProposedApi: true,
+    logLevel: 'off', // silencia los "Parsing error" del parser ante secuencias raras
   });
+
+  // Parte el stream conservando los delimitadores (split con grupo de captura los
+  // intercala) y descarta los segmentos vacios.
+  const parts = data.split(FRAME_BOUNDARY).filter((s) => s.length);
+  const writeChunk = (chunk) => new Promise((res) => term.write(chunk, res));
+
+  return (async () => {
+    const snapshots = [];
+    for (const part of parts) {
+      await writeChunk(part);
+      // Tras cerrar un frame (el segmento empieza con una frontera), captura el
+      // viewport actual: son las lineas a punto de ser repintadas por el siguiente.
+      if (FRAME_BOUNDARY.test(part)) snapshots.push(readBuffer(term, rows, true));
+    }
+    // Volcado final completo (incluye cualquier scrollback real acumulado).
+    snapshots.push(readBuffer(term, rows, false));
+    return snapshots.join('\n');
+  })();
 }
 
 // --- Reparacion de mojibake (UTF-8 leido como Windows-1252) ----------------
@@ -182,4 +217,11 @@ async function main() {
   }
 }
 
-main();
+// Exporta las piezas para poder probarlas de forma aislada (p. ej. la reconstruccion
+// de la conversacion completa a partir de un transcript que repinta en el sitio).
+export { renderToText, dedup, tidy, unmojibake, looksMojibake, trimTrailingClear };
+
+// Solo ejecuta el CLI cuando el script se invoca directamente (no al importarlo en un test).
+const invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (invokedDirectly) main();

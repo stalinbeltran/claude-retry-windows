@@ -9,9 +9,10 @@
   "scripts": {
     "start": "node claude-retry.mjs",
     "promote": "npm install -g .",
-    "test": "node tests/test-detection.mjs && node tests/test-verify.mjs",
+    "test": "node tests/test-detection.mjs && node tests/test-verify.mjs && node tests/test-clean-log.mjs",
     "test:detection": "node tests/test-detection.mjs",
-    "test:verify": "node tests/test-verify.mjs"
+    "test:verify": "node tests/test-verify.mjs",
+    "test:clean-log": "node tests/test-clean-log.mjs"
   },
   "dependencies": {
     "@xterm/headless": "^6.0.0",
