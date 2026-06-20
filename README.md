@@ -157,6 +157,60 @@ Tras reiniciar PowerShell:
 cr -p "tu prompt aqui"
 ```
 
+## Desarrollo: modificar el wrapper usándolo a él mismo
+
+Problema: si editas `claude-retry.mjs` y lo rompes, te quedas sin la herramienta
+que usabas para trabajar. Solución: usa una **instalación global congelada** como
+motor estable, e edita el repo aparte.
+
+### 1. Instalar el comando global (una vez)
+
+```powershell
+npm install -g .
+```
+
+Esto **copia** el proyecto a la ubicación global de npm y crea el comando
+`claude-retry`. Es independiente del repo: editar `claude-retry.mjs` aquí **no**
+cambia el comando global hasta que lo promuevas.
+
+### 2. Trabajar
+
+- Para **hacer el trabajo** (incluido editar este proyecto), usa el comando global
+  estable: `claude-retry -p "..."`.
+- Edita libremente `claude-retry.mjs` en el repo. Aunque lo dejes a medias o roto,
+  el comando global sigue intacto.
+
+### 3. Validar el cambio sin gastar cuota
+
+Antes de promover, prueba la versión del repo con el claude falso (ver más abajo),
+ejecutándola con `node` directamente (no con el comando global):
+
+```powershell
+Remove-Item .\.rl-counter -ErrorAction SilentlyContinue
+$env:CR_CLAUDE_BIN = (Resolve-Path .\fake-claude.cmd).Path
+$env:CR_FALLBACK_HOURS = "0.002"
+node claude-retry.mjs -p "prueba"          # ejecuta la versión EN EDICIÓN del repo
+Remove-Item Env:CR_CLAUDE_BIN, Env:CR_FALLBACK_HOURS
+```
+
+### 4. Promover la versión validada al comando global
+
+Cuando el cambio esté verificado:
+
+```powershell
+npm run promote        # alias de: npm install -g .
+```
+
+A partir de ahí, el comando global `claude-retry` ya incluye tus cambios.
+
+> **Instrucción lista para darle a claude:**
+> *"Edita `claude-retry.mjs`, verifícalo con `node claude-retry.mjs` usando el
+> claude falso (`CR_CLAUDE_BIN`), y cuando pase ejecuta `npm run promote` para
+> actualizar el comando global. No promuevas si la verificación falla."*
+
+Si algo sale mal, el comando global no se ve afectado, y `git checkout
+claude-retry.mjs` restaura el archivo del repo a la última versión commiteada.
+
 ## Cómo detecta el límite
 
 El wrapper escanea la salida combinada (stdout + stderr) contra patrones como

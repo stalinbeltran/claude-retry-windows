@@ -7,7 +7,8 @@
     "claude-retry": "claude-retry.mjs"
   },
   "scripts": {
-    "start": "node claude-retry.mjs"
+    "start": "node claude-retry.mjs",
+    "promote": "npm install -g ."
   },
   "dependencies": {
     "node-pty": "^1.0.0"
