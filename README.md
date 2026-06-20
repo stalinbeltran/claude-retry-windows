@@ -233,9 +233,12 @@ Para **revertir** si algo sale mal:
 
 ## Cómo detecta el límite
 
-El wrapper escanea la salida combinada (stdout + stderr) contra patrones como
-`usage limit reached`, `rate limit`, `too many requests`, `429`,
-`try again later/at/in`, etc. Si detecta uno:
+El wrapper escanea la salida combinada (stdout + stderr) contra patrones
+**específicos del mensaje de error real** del CLI, como `usage limit reached`,
+`5-hour limit reached`, `rate_limit_error` (el 429 de la API), etc. Los patrones
+se mantienen estrictos a propósito: frases de uso común (`rate limit`, `try again
+later`, un `429` suelto) provocarían falsos positivos cuando claude las menciona en
+una respuesta normal. Si detecta uno:
 
 1. Intenta leer la hora de reinicio del mensaje (formatos como *"reset in 2 hours"*,
    *"try again at 3pm"*, *"reset at 15:00"*).

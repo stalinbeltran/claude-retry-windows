@@ -24,14 +24,19 @@ const CFG = {
 };
 
 // --- Deteccion de limite de uso -------------------------------------------
+// IMPORTANTE: estos patrones se escanean sobre TODA la salida de claude, incluido
+// el texto normal de la conversacion. Por eso deben ser especificos del MENSAJE DE
+// ERROR real del CLI y no frases de uso comun. Patrones amplios como /rate limit/i
+// o /try again later/i producen falsos positivos (claude mencionando esos terminos
+// en una respuesta normal dispara una espera de horas que no corresponde).
 const RATE_LIMIT_PATTERNS = [
-  /usage limit reached/i,
-  /rate limit/i,
-  /too many requests/i,
-  /\b429\b/,
-  /you'?ve reached your.*limit/i,
-  /reset[s]? (?:at|in)/i,
-  /try again (?:later|at|in)/i,
+  /usage limit reached/i, // "Claude usage limit reached. Your limit will reset at ..."
+  /claude usage limit/i, // variante del banner de suscripcion
+  /\b\d+\s*-?\s*hour limit reached/i, // "5-hour limit reached ∙ resets ..."
+  /you'?ve reached your.*usage limit/i,
+  /rate_limit_error/i, // tipo de error en el JSON del 429 de la API
+  /\b429\b[^\n]*too many requests/i, // linea explicita de HTTP 429
+  /too many requests[^\n]*\b429\b/i,
 ];
 
 function isRateLimited(text) {
