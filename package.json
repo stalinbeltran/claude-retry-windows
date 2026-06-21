@@ -9,8 +9,9 @@
   "scripts": {
     "start": "node claude-retry.mjs",
     "promote": "npm install -g .",
-    "test": "node tests/test-detection.mjs && node tests/test-retry.mjs",
+    "test": "node tests/test-detection.mjs && node tests/test-multiturn.mjs && node tests/test-retry.mjs",
     "test:detection": "node tests/test-detection.mjs",
+    "test:multiturn": "node tests/test-multiturn.mjs",
     "test:retry": "node tests/test-retry.mjs"
   }
 }

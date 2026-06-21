@@ -23,6 +23,9 @@ Corre en Node nativo (no necesita `tmux`, `bash` ni dependencias externas).
 - **Respuestas automáticas** — reenvío automático del modo de permisos
   (`CR_PERMISSION_MODE`) y opción de retomar la conversación al reintentar
   (`CR_CONTINUE_ON_RETRY`).
+- **Multi-turno con `-a`** — si claude termina haciéndote una pregunta, respondes
+  con `-a "tu respuesta"` y la conversación continúa (con `--continue` por debajo),
+  sin TUI. Ver [Responder a una pregunta](#opción-4--responder-a-una-pregunta-multi-turno).
 - **Limpieza de procesos** — en Windows usa `taskkill /T /F` para no dejar
   procesos huérfanos al cortar la sesión.
 
@@ -76,6 +79,39 @@ El wrapper respeta el piping. Útil para pasarle el contenido de un archivo:
 Get-Content .\app.py -Raw | node claude-retry.mjs -p "Revisa este codigo y dime si tiene bugs"
 ```
 
+### Opción 4 — Responder a una pregunta (multi-turno)
+
+El modo `-p` es de un solo turno: claude ejecuta y termina. Si termina haciéndote una
+**pregunta** (p. ej. "¿uso JWT o cookies?"), no se queda esperando. Para no perder el
+hilo, **tras cada ejecución** el wrapper **guarda la sesión** (los flags usados) y te
+dice cómo continuar. Respondes con `-a` y la conversación sigue:
+
+```powershell
+node claude-retry.mjs -p "refactoriza el login" --permission-mode acceptEdits
+# ...claude responde y pregunta: ¿Uso JWT o cookies?
+# [claude-retry] Parece que claude te hizo una pregunta.
+# [claude-retry] Sesion guardada. Para responder y continuar (desde este mismo directorio):
+#     node claude-retry.mjs -a "tu respuesta"
+
+node claude-retry.mjs -a "usa JWT"
+# ...claude retoma TODO el contexto y continúa. Si vuelve a preguntar, repites el ciclo.
+```
+
+Detalles:
+
+- **Mismo directorio.** Lanza el `-a` desde el mismo `cwd` que el `-p`: tanto el estado
+  guardado como `claude --continue` están ligados al directorio de trabajo.
+- **Reusa tus flags.** La respuesta reaprovecha los flags del turno anterior
+  (`--permission-mode`, `--model`, …); no hace falta repetirlos. Puedes añadir flags
+  extra en el `-a` si quieres (`node claude-retry.mjs -a "usa JWT" --model opus`).
+- **El contexto lo guarda claude**, no el wrapper: `-a` añade `--continue` por debajo,
+  que retoma la última conversación del directorio. El wrapper solo persiste *cómo*
+  relanzar el comando.
+- **Reintento por límite incluido.** Si el turno de respuesta topa con el límite de
+  uso, se aplica el mismo ciclo de esperar y reintentar.
+- **Texto que empieza por `-`.** Usa la forma con `=`: `-a="-y, usa esa opción"`.
+- Para desactivar el guardado y el aviso, pon `CR_SESSION=off`.
+
 ## Configuración (variables de entorno)
 
 Se fijan **antes** del comando, en la misma sesión de PowerShell, **o en un
@@ -94,6 +130,9 @@ opcionales.
 | `CR_DETECTION_PRECISION` | 70      | precisión requerida (0-100, o 0-1) para la detección **estadística** de variantes no catalogadas |
 | `CR_DETECT_DEBUG`        | off     | imprime la puntuación y las señales que casaron en cada detección |
 | `CR_TRANSCRIPT`          | off     | ruta de archivo donde volcar TODA la salida (stdout+stderr en bruto, incluidos los reintentos) |
+| `CR_SESSION`             | on      | guarda la sesión tras cada ejecución para poder responder con `-a` (ver [Opción 4](#opción-4--responder-a-una-pregunta-multi-turno)). `off` lo desactiva |
+| `CR_STATE_DIR`           | auto    | carpeta del estado de sesión (def `~/.claude-retry/sessions`); se indexa por directorio de trabajo |
+| `CR_INVOCATION`          | auto    | cómo se muestra el comando en el aviso de "responde con `-a` …" (p. ej. `cr` si usas ese alias) |
 
 ### Detección de límite (dos capas)
 
@@ -361,6 +400,7 @@ Dentro de `tests/`:
 | Archivo                          | Descripción                                            |
 |----------------------------------|--------------------------------------------------------|
 | `test-detection.mjs`             | Test unitario de la detección de límite y parseo de hora. |
+| `test-multiturn.mjs`             | Test unitario de los helpers del modo `-a` (multi-turno). |
 | `test-retry.mjs`                 | Test e2e del bucle de reintento en modo `-p`.          |
 | `fake-claude.cmd` / `.mjs`       | Claude falso (un disparo) que simula un rate limit.    |
 | `fake-claude-variants.cmd` / `.mjs` | Claude falso con variantes de banner (`FAKE_VARIANT`). |
